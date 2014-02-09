@@ -1,0 +1,1487 @@
+diff --git a/doc/src/sgml/gin.sgml b/doc/src/sgml/gin.sgml
+new file mode 100644
+index 9ffa8be..c8a6b50
+*** a/doc/src/sgml/gin.sgml
+--- b/doc/src/sgml/gin.sgml
+***************
+*** 216,221 ****
+--- 216,230 ----
+         arrays previously returned by <function>extractQuery</>.
+         <literal>extra_data</> is the extra-data array returned by
+         <function>extractQuery</>, or <symbol>NULL</symbol> if none.
++        <function>consistent</> can be declared as either 1st or 6th support
++        function of opclass. If it's declared as 6th then it must support
++        tri-state logic can be used for fast scan technique which accelerating
++        gin index scan by skipping parts of large posting-trees. Tri-state
++        version of <function>consistent</> accepts <literal>UNKNOWN</> values
++        in <literal>check</> array. These values means that indexed item can
++        either contain or not contain corresponding query key. Consistent
++        might return <literal>UNKNOWN</> values as well when given information
++        is lacking for exact answer.
+        </para>
+  
+        <para>
+diff --git a/src/backend/access/gin/Makefile b/src/backend/access/gin/Makefile
+new file mode 100644
+index aabc62f..db4f496
+*** a/src/backend/access/gin/Makefile
+--- b/src/backend/access/gin/Makefile
+*************** include $(top_builddir)/src/Makefile.glo
+*** 14,19 ****
+  
+  OBJS = ginutil.o gininsert.o ginxlog.o ginentrypage.o gindatapage.o \
+  	ginbtree.o ginscan.o ginget.o ginvacuum.o ginarrayproc.o \
+! 	ginbulk.o ginfast.o ginpostinglist.o
+  
+  include $(top_srcdir)/src/backend/common.mk
+--- 14,19 ----
+  
+  OBJS = ginutil.o gininsert.o ginxlog.o ginentrypage.o gindatapage.o \
+  	ginbtree.o ginscan.o ginget.o ginvacuum.o ginarrayproc.o \
+! 	ginbulk.o ginfast.o ginpostinglist.o ginlogic.o
+  
+  include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/access/gin/README b/src/backend/access/gin/README
+new file mode 100644
+index 3f0c3e2..6750769
+*** a/src/backend/access/gin/README
+--- b/src/backend/access/gin/README
+*************** page-deletions safe; it stamps the delet
+*** 335,340 ****
+--- 335,346 ----
+  deleted pages around with the right-link intact until all concurrent scans
+  have finished.)
+  
++ Fast scan
++ ---------
++ 
++ Fast scan is technique which allows to skip parts of large posting-trees during
++ gin index scan. 
++ 
+  Compatibility
+  -------------
+  
+*************** posting list fits in the space occupied 
+*** 365,370 ****
+--- 371,400 ----
+  assume that the compressed version of the page, with the dead items removed,
+  takes less space than the old uncompressed version.
+  
++ Fast scan
++ ---------
++ 
++ Fast scan is technique allowing to skip parts of large posting trees during
++ gin index scans. Fast scan is based on tri-state consistent function. Tri-state
++ consistent function must support following values:
++ 1) TRUE
++ 2) FALSE
++ 3) UNKNOWN
++ GIN passes UNKNOWN into check array for those keys which parts of posting trees
++ it tries to skip. If consistent function returns false then it can actually
++ skip part of posting tree.
++ 
++ In more details fast scans works following:
++ 1) Keep entries sorted by their current TIDs descending.
++ 2) Tries to skip some of entries at the end of sorted order. It passes
++    TRUE for the first part of entries and UNKNOWN for others. It moves the
++    border splitting TRUE and UNKNOWN until finds where consistent begins to
++    return FALSE.
++ 3) If tri-state consistent returns FALSE, it skips part of shortest entry which
++    was UNKNOWN (other entries could be skipped later for greater value). 
++ 4) If tri-state consistent doesn't return FALSE then it calls exact consistent
++    and moves entries TIDs like regular gin index scan.
++ 
+  Limitations
+  -----------
+  
+diff --git a/src/backend/access/gin/gindatapage.c b/src/backend/access/gin/gindatapage.c
+new file mode 100644
+index c6230f3..3459f17
+*** a/src/backend/access/gin/gindatapage.c
+--- b/src/backend/access/gin/gindatapage.c
+*************** GinDataLeafPageGetItems(Page page, int *
+*** 133,142 ****
+  		}
+  
+  		if (len > 0)
+  			result = ginPostingListDecodeAllSegments(seg, len, nitems);
+  		else
+  		{
+! 			result = NULL;
+  			*nitems = 0;
+  		}
+  	}
+--- 133,144 ----
+  		}
+  
+  		if (len > 0)
++ 		{
+  			result = ginPostingListDecodeAllSegments(seg, len, nitems);
++ 		}
+  		else
+  		{
+! 			result = palloc(0);
+  			*nitems = 0;
+  		}
+  	}
+diff --git a/src/backend/access/gin/ginget.c b/src/backend/access/gin/ginget.c
+new file mode 100644
+index a45d722..91f1028
+*** a/src/backend/access/gin/ginget.c
+--- b/src/backend/access/gin/ginget.c
+*************** typedef struct pendingPosition
+*** 32,72 ****
+  	bool	   *hasMatchKey;
+  } pendingPosition;
+  
+- 
+- /*
+-  * Convenience function for invoking a key's consistentFn
+-  */
+- static bool
+- callConsistentFn(GinState *ginstate, GinScanKey key)
+- {
+- 	/*
+- 	 * If we're dealing with a dummy EVERYTHING key, we don't want to call the
+- 	 * consistentFn; just claim it matches.
+- 	 */
+- 	if (key->searchMode == GIN_SEARCH_MODE_EVERYTHING)
+- 	{
+- 		key->recheckCurItem = false;
+- 		return true;
+- 	}
+- 
+- 	/*
+- 	 * Initialize recheckCurItem in case the consistentFn doesn't know it
+- 	 * should set it.  The safe assumption in that case is to force recheck.
+- 	 */
+- 	key->recheckCurItem = true;
+- 
+- 	return DatumGetBool(FunctionCall8Coll(&ginstate->consistentFn[key->attnum - 1],
+- 								 ginstate->supportCollation[key->attnum - 1],
+- 										  PointerGetDatum(key->entryRes),
+- 										  UInt16GetDatum(key->strategy),
+- 										  key->query,
+- 										  UInt32GetDatum(key->nuserentries),
+- 										  PointerGetDatum(key->extra_data),
+- 									   PointerGetDatum(&key->recheckCurItem),
+- 										  PointerGetDatum(key->queryValues),
+- 									 PointerGetDatum(key->queryCategories)));
+- }
+- 
+  /*
+   * Goes to the next page if current offset is outside of bounds
+   */
+--- 32,37 ----
+*************** startScanKey(GinState *ginstate, GinScan
+*** 460,465 ****
+--- 425,432 ----
+  	key->curItemMatches = false;
+  	key->recheckCurItem = false;
+  	key->isFinished = false;
++ 
++ 	GinInitConsistentMethod(ginstate, key);
+  }
+  
+  static void
+*************** entryGetItem(GinState *ginstate, GinScan
+*** 785,790 ****
+--- 752,777 ----
+  }
+  
+  /*
++  * Comparison function for scan entry indexes. Sorts them by descending of
++  * curItem assuming lossy page is lowest item pointer in page.
++  */
++ static int
++ cmpEntries(const void *a1, const void *a2, void *arg)
++ {
++ 	const GinScanKey key = (const GinScanKey)arg;
++ 	int i1 = *(const int *)a1;
++ 	int i2 = *(const int *)a2;
++ 	ItemPointerData iptr1 = key->scanEntry[i1]->curItem;
++ 	ItemPointerData iptr2 = key->scanEntry[i2]->curItem;
++ 
++ 	if (ItemPointerIsLossyPage(&iptr1))
++ 		iptr1.ip_posid = 0;
++ 	if (ItemPointerIsLossyPage(&iptr2))
++ 		iptr2.ip_posid = 0;
++ 	return -ginCompareItemPointers(&iptr1, &iptr2);
++ }
++ 
++ /*
+   * Identify the "current" item among the input entry streams for this scan key
+   * that is greater than advancePast, and test whether it passes the scan key
+   * qual condition.
+*************** keyGetItem(GinState *ginstate, MemoryCon
+*** 812,829 ****
+  	ItemPointerData minItem;
+  	ItemPointerData curPageLossy;
+  	uint32		i;
+- 	uint32		lossyEntry;
+  	bool		haveLossyEntry;
+  	GinScanEntry entry;
+- 	bool		res;
+  	MemoryContext oldCtx;
+  	bool		allFinished;
+  
+  	Assert(!key->isFinished);
+  
+  	/*
+  	 * We might have already tested this item; if so, no need to repeat work.
+! 	 * (Note: the ">" case can happen, if minItem is exact but we previously
+  	 * had to set curItem to a lossy-page pointer.)
+  	 */
+  	if (ginCompareItemPointers(&key->curItem, &advancePast) > 0)
+--- 799,818 ----
+  	ItemPointerData minItem;
+  	ItemPointerData curPageLossy;
+  	uint32		i;
+  	bool		haveLossyEntry;
+  	GinScanEntry entry;
+  	MemoryContext oldCtx;
+  	bool		allFinished;
++ 	bool		allUnknown;
++ 	int			minUnknown;
++ 	GinLogicValue res;
++ 	int		   *entryIndexes;
+  
+  	Assert(!key->isFinished);
+  
+  	/*
+  	 * We might have already tested this item; if so, no need to repeat work.
+! 	 * (Note: the ">" case can happen, if advancePast is exact but we previously
+  	 * had to set curItem to a lossy-page pointer.)
+  	 */
+  	if (ginCompareItemPointers(&key->curItem, &advancePast) > 0)
+*************** keyGetItem(GinState *ginstate, MemoryCon
+*** 837,991 ****
+  	 * same page.  So we'll prefer to return exact pointers not lossy
+  	 * pointers, which is good.
+  	 */
+! 	ItemPointerSetMax(&minItem);
+! 	allFinished = true;
+  	for (i = 0; i < key->nentries; i++)
+! 	{
+! 		entry = key->scanEntry[i];
+  
+! 		/*
+! 		 * Advance this stream if necessary.
+! 		 *
+! 		 * In particular, since entry->curItem was initialized with
+! 		 * ItemPointerSetMin, this ensures we fetch the first item for each
+! 		 * entry on the first call.
+! 		 */
+! 		while (entry->isFinished == FALSE &&
+! 			   ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
+  		{
+! 			entryGetItem(ginstate, entry, advancePast);
+  		}
+  
+! 		if (!entry->isFinished)
+  		{
+! 			allFinished = FALSE;
+  			if (ginCompareItemPointers(&entry->curItem, &minItem) < 0)
+  				minItem = entry->curItem;
+  		}
+- 	}
+  
+! 	if (allFinished)
+! 	{
+! 		/* all entries are finished */
+! 		key->isFinished = TRUE;
+! 		return;
+! 	}
+  
+! 	/*
+! 	 * OK, set key->curItem and perform consistentFn test.
+! 	 */
+! 	key->curItem = minItem;
+  
+! 	/*
+! 	 * Lossy-page entries pose a problem, since we don't know the correct
+! 	 * entryRes state to pass to the consistentFn, and we also don't know what
+! 	 * its combining logic will be (could be AND, OR, or even NOT). If the
+! 	 * logic is OR then the consistentFn might succeed for all items in the
+! 	 * lossy page even when none of the other entries match.
+! 	 *
+! 	 * If we have a single lossy-page entry then we check to see if the
+! 	 * consistentFn will succeed with only that entry TRUE.  If so, we return
+! 	 * a lossy-page pointer to indicate that the whole heap page must be
+! 	 * checked.  (On subsequent calls, we'll do nothing until minItem is past
+! 	 * the page altogether, thus ensuring that we never return both regular
+! 	 * and lossy pointers for the same page.)
+! 	 *
+! 	 * This idea could be generalized to more than one lossy-page entry, but
+! 	 * ideally lossy-page entries should be infrequent so it would seldom be
+! 	 * the case that we have more than one at once.  So it doesn't seem worth
+! 	 * the extra complexity to optimize that case. If we do find more than
+! 	 * one, we just punt and return a lossy-page pointer always.
+! 	 *
+! 	 * Note that only lossy-page entries pointing to the current item's page
+! 	 * should trigger this processing; we might have future lossy pages in the
+! 	 * entry array, but they aren't relevant yet.
+! 	 */
+! 	ItemPointerSetLossyPage(&curPageLossy,
+! 							GinItemPointerGetBlockNumber(&key->curItem));
+  
+! 	lossyEntry = 0;
+! 	haveLossyEntry = false;
+! 	for (i = 0; i < key->nentries; i++)
+! 	{
+! 		entry = key->scanEntry[i];
+! 		if (entry->isFinished == FALSE &&
+! 			ginCompareItemPointers(&entry->curItem, &curPageLossy) == 0)
+  		{
+! 			if (haveLossyEntry)
+  			{
+! 				/* Multiple lossy entries, punt */
+  				key->curItem = curPageLossy;
+  				key->curItemMatches = true;
+  				key->recheckCurItem = true;
+  				return;
+  			}
+- 			lossyEntry = i;
+- 			haveLossyEntry = true;
+  		}
+- 	}
+  
+! 	/* prepare for calling consistentFn in temp context */
+! 	oldCtx = MemoryContextSwitchTo(tempCtx);
+  
+! 	if (haveLossyEntry)
+! 	{
+! 		/* Single lossy-page entry, so see if whole page matches */
+! 		memset(key->entryRes, FALSE, key->nentries);
+! 		key->entryRes[lossyEntry] = TRUE;
+  
+! 		if (callConsistentFn(ginstate, key))
+  		{
+! 			/* Yes, so clean up ... */
+! 			MemoryContextSwitchTo(oldCtx);
+! 			MemoryContextReset(tempCtx);
+! 
+! 			/* and return lossy pointer for whole page */
+! 			key->curItem = curPageLossy;
+! 			key->curItemMatches = true;
+! 			key->recheckCurItem = true;
+! 			return;
+! 		}
+! 	}
+  
+! 	/*
+! 	 * At this point we know that we don't need to return a lossy whole-page
+! 	 * pointer, but we might have matches for individual exact item pointers,
+! 	 * possibly in combination with a lossy pointer.  Our strategy if there's
+! 	 * a lossy pointer is to try the consistentFn both ways and return a hit
+! 	 * if it accepts either one (forcing the hit to be marked lossy so it will
+! 	 * be rechecked).  An exception is that we don't need to try it both ways
+! 	 * if the lossy pointer is in a "hidden" entry, because the consistentFn's
+! 	 * result can't depend on that.
+! 	 *
+! 	 * Prepare entryRes array to be passed to consistentFn.
+! 	 */
+! 	for (i = 0; i < key->nentries; i++)
+! 	{
+! 		entry = key->scanEntry[i];
+! 		if (entry->isFinished == FALSE &&
+! 			ginCompareItemPointers(&entry->curItem, &key->curItem) == 0)
+! 			key->entryRes[i] = TRUE;
+! 		else
+! 			key->entryRes[i] = FALSE;
+! 	}
+! 	if (haveLossyEntry)
+! 		key->entryRes[lossyEntry] = TRUE;
+  
+! 	res = callConsistentFn(ginstate, key);
+  
+! 	if (!res && haveLossyEntry && lossyEntry < key->nuserentries)
+! 	{
+! 		/* try the other way for the lossy item */
+! 		key->entryRes[lossyEntry] = FALSE;
+  
+! 		res = callConsistentFn(ginstate, key);
+  	}
+  
+- 	key->curItemMatches = res;
+- 	/* If we matched a lossy entry, force recheckCurItem = true */
+- 	if (haveLossyEntry)
+- 		key->recheckCurItem = true;
+- 
+  	/* clean up after consistentFn calls */
+  	MemoryContextSwitchTo(oldCtx);
+  	MemoryContextReset(tempCtx);
+--- 826,1039 ----
+  	 * same page.  So we'll prefer to return exact pointers not lossy
+  	 * pointers, which is good.
+  	 */
+! 	oldCtx = CurrentMemoryContext;
+! 	entryIndexes = (int *)MemoryContextAlloc(tempCtx,
+! 			sizeof(int) * key->nentries);
+  	for (i = 0; i < key->nentries; i++)
+! 		entryIndexes[i] = i;
+  
+! 	for (;;)
+! 	{
+! restart:
+! 		qsort_arg(entryIndexes, key->nentries, sizeof(int), cmpEntries, key);
+! 		for (i = 0; i < key->nentries; i++)
+! 			key->entryRes[i] = GIN_MAYBE;
+! 		for (i = 0; i < key->nentries - 1; i++)
+  		{
+! 			uint32 minPredictNumberResult;
+! 			int minPredictNumberResultIndex = -1;
+! 
+! 			key->entryRes[entryIndexes[i]] = GIN_FALSE;
+! 
+! 			if (ginCompareItemPointers(
+! 					&key->scanEntry[entryIndexes[i]]->curItem,
+! 					&key->scanEntry[entryIndexes[i + 1]]->curItem) == 0)
+! 				continue;
+! 
+! 			MemoryContextSwitchTo(tempCtx);
+! 			res = key->triConsistentFn(key);
+! 			MemoryContextSwitchTo(oldCtx);
+! 			if (res == GIN_FALSE)
+! 			{
+! 				int j;
+! 				advancePast = key->scanEntry[entryIndexes[i]]->curItem;
+! 				advancePast.ip_posid--;
+! 				for (j = i + 1; j < key->nentries; j++)
+! 				{
+! 					GinScanEntry entry = key->scanEntry[entryIndexes[j]];
+! 					if (minPredictNumberResultIndex == -1 ||
+! 							entry->predictNumberResult < minPredictNumberResult)
+! 					{
+! 						minPredictNumberResult = entry->predictNumberResult;
+! 						minPredictNumberResultIndex = entryIndexes[j];
+! 					}
+! 				}
+! 				Assert(minPredictNumberResultIndex >= 0);
+! 				entryGetItem(ginstate, key->scanEntry[minPredictNumberResultIndex], advancePast);
+! 				goto restart;
+! 			}
+  		}
+  
+! 		ItemPointerSetMax(&minItem);
+! 		allFinished = true;
+! 		allUnknown = true;
+! 		minUnknown = -1;
+! 		for (i = 0; i < key->nentries; i++)
+  		{
+! 			entry = key->scanEntry[i];
+! 
+! 			if (entry->isFinished)
+! 				continue;
+! 			allFinished = false;
+! 
+! 			if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
+! 				entryGetItem(ginstate, entry, advancePast);
+! 
+  			if (ginCompareItemPointers(&entry->curItem, &minItem) < 0)
+  				minItem = entry->curItem;
+  		}
+  
+! 		if (allFinished)
+! 		{
+! 			/* all entries are finished */
+! 			key->isFinished = TRUE;
+! 			return;
+! 		}
+  
+! 		/*
+! 		 * Ok, we now know that there are no matches < minItem. Proceed to
+! 		 * check if it's a match.
+! 		 */
+! 		key->curItem = minItem;
+! 		ItemPointerSetLossyPage(&curPageLossy,
+! 								GinItemPointerGetBlockNumber(&minItem));
+  
+! 		/*
+! 		 * Lossy-page entries pose a problem, since we don't know the correct
+! 		 * entryRes state to pass to the consistentFn, and we also don't know
+! 		 * what its combining logic will be (could be AND, OR, or even NOT).
+! 		 * If the logic is OR then the consistentFn might succeed for all items
+! 		 * in the lossy page even when none of the other entries match.
+! 		 *
+! 		 * Our strategy is to call the tri-state consistent function, with the
+! 		 * lossy-page entries set to MAYBE, and all the other entries FALSE.
+! 		 * If it returns FALSE, none of the lossy items alone are enough for a
+! 		 * match, so we don't need to return a lossy-page pointer. Otherwise,
+! 		 * return a lossy-page pointer to indicate that the whole heap page must
+! 		 * be checked.  (On subsequent calls, we'll do nothing until minItem is
+! 		 * past the page altogether, thus ensuring that we never return both
+! 		 * regular and lossy pointers for the same page.)
+! 		 *
+! 		 * An exception is that we don't need to try it both ways (ie. pass
+! 		 * MAYBE) if the lossy pointer is in a "hidden" entry, because the
+! 		 * consistentFn's result can't depend on that (but mark the result as
+! 		 * 'recheck').
+! 		 *
+! 		 * Note that only lossy-page entries pointing to the current item's
+! 		 * page should trigger this processing; we might have future lossy
+! 		 * pages in the entry array, but they aren't relevant yet.
+! 		 */
+! 		haveLossyEntry = false;
+! 		for (i = 0; i < key->nentries; i++)
+! 		{
+! 			entry = key->scanEntry[i];
+! 			if (entry->isFinished == FALSE &&
+! 				ginCompareItemPointers(&entry->curItem, &curPageLossy) == 0)
+! 			{
+! 				key->entryRes[i] = GIN_MAYBE;
+! 				haveLossyEntry = true;
+! 			}
+! 			else
+! 				key->entryRes[i] = GIN_FALSE;
+! 		}
+  
+! 		if (haveLossyEntry)
+  		{
+! 			MemoryContextSwitchTo(tempCtx);
+! 			res = key->triConsistentFn(key);
+! 			MemoryContextSwitchTo(oldCtx);
+! 
+! 			if (res == GIN_TRUE || res == GIN_MAYBE)
+  			{
+! 				/* Some of the lossy items on the heap page might match, punt */
+  				key->curItem = curPageLossy;
+  				key->curItemMatches = true;
+  				key->recheckCurItem = true;
+  				return;
+  			}
+  		}
+  
+! 		/*
+! 		 * Let's call the consistent function to check if this is a match.
+! 		 *
+! 		 * At this point we know that we don't need to return a lossy
+! 		 * whole-page pointer, but we might have matches for individual exact
+! 		 * item pointers, possibly in combination with a lossy pointer. Pass
+! 		 * lossy pointers as MAYBE to the ternary consistent function, to
+! 		 * let it decide if this tuple satisfies the overall key, even though
+! 		 * we don't know whether the lossy entries match.
+! 		 *
+! 		 * We might also not have advanced all the entry streams up to this
+! 		 * point yet. It's possible that the consistent function can
+! 		 * nevertheless decide that this is definitely a match or not a match,
+! 		 * even though we don't know if those unknown entries match, so we
+! 		 * pass them as MAYBE.
+! 		 */
+! 		for (i = 0; i < key->nentries; i++)
+! 		{
+! 			entry = key->scanEntry[i];
+! 			if (entry->isFinished)
+! 				key->entryRes[i] = GIN_FALSE;
+! 			else if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
+! 				key->entryRes[i] = GIN_MAYBE; /* not loaded yet */
+! 			else if (ginCompareItemPointers(&entry->curItem, &curPageLossy) == 0)
+! 				key->entryRes[i] = GIN_MAYBE;
+! 			else if (ginCompareItemPointers(&entry->curItem, &minItem) == 0)
+! 				key->entryRes[i] = GIN_TRUE;
+! 			else
+! 				key->entryRes[i] = GIN_FALSE;
+! 		}
+  
+! 		MemoryContextSwitchTo(tempCtx);
+! 		res = key->triConsistentFn(key);
+! 		MemoryContextSwitchTo(oldCtx);
+  
+! 		switch (res)
+  		{
+! 			case GIN_TRUE:
+! 				key->curItemMatches = true;
+! 				/* triConsistentFn set recheckCurItem */
+! 				break;
+  
+! 			case GIN_FALSE:
+! 				key->curItemMatches = false;
+! 				break;
+  
+! 			case GIN_MAYBE:
+! 				key->curItemMatches = true;
+! 				key->recheckCurItem = true;
+! 				break;
+  
+! 			default:
+! 				/*
+! 				 * the 'default' case shouldn't happen, but if the consistent
+! 				 * function returns something bogus, this is the safe result
+! 				 */
+! 				key->curItemMatches = true;
+! 				key->recheckCurItem = true;
+! 				break;
+! 		}
+  
+! 		/*
+! 		 * We have a tuple, and we know if it mathes or not. If it's a
+! 		 * non-match, we could continue to find the next matching tuple, but
+! 		 * let's break out and give scanGetItem a chance to advance the other
+! 		 * keys. They might be able to skip past to a much higher TID, allowing
+! 		 * us to save work.
+! 		 */
+! 		break;
+  	}
+  
+  	/* clean up after consistentFn calls */
+  	MemoryContextSwitchTo(oldCtx);
+  	MemoryContextReset(tempCtx);
+*************** collectMatchesForHeapRow(IndexScanDesc s
+*** 1322,1328 ****
+  	{
+  		GinScanKey	key = so->keys + i;
+  
+! 		memset(key->entryRes, FALSE, key->nentries);
+  	}
+  	memset(pos->hasMatchKey, FALSE, so->nkeys);
+  
+--- 1370,1376 ----
+  	{
+  		GinScanKey	key = so->keys + i;
+  
+! 		memset(key->entryRes, GIN_FALSE, key->nentries);
+  	}
+  	memset(pos->hasMatchKey, FALSE, so->nkeys);
+  
+*************** scanPendingInsert(IndexScanDesc scan, TI
+*** 1579,1585 ****
+  		{
+  			GinScanKey	key = so->keys + i;
+  
+! 			if (!callConsistentFn(&so->ginstate, key))
+  			{
+  				match = false;
+  				break;
+--- 1627,1633 ----
+  		{
+  			GinScanKey	key = so->keys + i;
+  
+! 			if (!key->boolConsistentFn(key))
+  			{
+  				match = false;
+  				break;
+diff --git a/src/backend/access/gin/ginlogic.c b/src/backend/access/gin/ginlogic.c
+new file mode 100644
+index ...90ffef0
+*** a/src/backend/access/gin/ginlogic.c
+--- b/src/backend/access/gin/ginlogic.c
+***************
+*** 0 ****
+--- 1,139 ----
++ /*-------------------------------------------------------------------------
++  *
++  * ginlogic.c
++  *	  routines for performing binary- and ternary-logic consistent checks.
++  *
++  *
++  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
++  * Portions Copyright (c) 1994, Regents of the University of California
++  *
++  * IDENTIFICATION
++  *			src/backend/access/gin/ginlogic.c
++  *-------------------------------------------------------------------------
++  */
++ 
++ #include "postgres.h"
++ 
++ #include "access/gin_private.h"
++ #include "access/reloptions.h"
++ #include "catalog/pg_collation.h"
++ #include "catalog/pg_type.h"
++ #include "miscadmin.h"
++ #include "storage/indexfsm.h"
++ #include "storage/lmgr.h"
++ 
++ /*
++  * A dummy consistent function for an EVERYTHING key. Just claim it matches.
++  */
++ static bool
++ trueConsistentFn(GinScanKey key)
++ {
++ 	key->recheckCurItem = false;
++ 	return true;
++ }
++ static GinLogicValue
++ trueTriConsistentFn(GinScanKey key)
++ {
++ 	return GIN_MAYBE;
++ }
++ 
++ /*
++  * A function for calling a regular, binary logic, consistent function.
++  */
++ static bool
++ normalBoolConsistentFn(GinScanKey key)
++ {
++ 	/*
++ 	 * Initialize recheckCurItem in case the consistentFn doesn't know it
++ 	 * should set it.  The safe assumption in that case is to force recheck.
++ 	 */
++ 	key->recheckCurItem = true;
++ 
++ 	return DatumGetBool(FunctionCall8Coll(key->consistentFmgrInfo,
++ 										  key->collation,
++ 										  PointerGetDatum(key->entryRes),
++ 										  UInt16GetDatum(key->strategy),
++ 										  key->query,
++ 										  UInt32GetDatum(key->nuserentries),
++ 										  PointerGetDatum(key->extra_data),
++ 									   PointerGetDatum(&key->recheckCurItem),
++ 										  PointerGetDatum(key->queryValues),
++ 									 PointerGetDatum(key->queryCategories)));
++ }
++ 
++ /*
++  * This function implements a tri-state consistency check, using a boolean
++  * consistent function provided by the opclass.
++  *
++  * If there is only one MAYBE input, our strategy is to try the consistentFn
++  * both ways. If it returns TRUE for both, the tuple matches regardless of
++  * the MAYBE input, so we return TRUE. Likewise, if it returns FALSE for both,
++  * we return FALSE. Otherwise return MAYBE.
++  */
++ static GinLogicValue
++ shimTriConsistentFn(GinScanKey key)
++ {
++ 	bool		foundMaybe = false;
++ 	int			maybeEntry = -1;
++ 	int			i;
++ 	bool		boolResult1;
++ 	bool		boolResult2;
++ 	bool		recheck1;
++ 	bool		recheck2;
++ 
++ 	for (i = 0; i < key->nentries; i++)
++ 	{
++ 		if (key->entryRes[i] == GIN_MAYBE)
++ 		{
++ 			if (foundMaybe)
++ 				return GIN_MAYBE;		/* more than one MAYBE input */
++ 			maybeEntry = i;
++ 			foundMaybe = true;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * If none of the inputs were MAYBE, so we can just call consistent
++ 	 * function as is.
++ 	 */
++ 	if (!foundMaybe)
++ 		return normalBoolConsistentFn(key);
++ 
++ 	/* Try the consistent function with the maybe-input set both ways */
++ 	key->entryRes[maybeEntry] = GIN_TRUE;
++ 	boolResult1 = normalBoolConsistentFn(key);
++ 	recheck1 = key->recheckCurItem;
++ 
++ 	key->entryRes[maybeEntry] = GIN_FALSE;
++ 	boolResult2 = normalBoolConsistentFn(key);
++ 	recheck2 = key->recheckCurItem;
++ 
++ 	if (!boolResult1 && !boolResult2)
++ 		return GIN_FALSE;
++ 
++ 	key->recheckCurItem = recheck1 || recheck2;
++ 	if (boolResult1 && boolResult2)
++ 		return GIN_TRUE;
++ 	else
++ 		return GIN_MAYBE;
++ }
++ 
++ void
++ GinInitConsistentMethod(GinState *ginstate, GinScanKey key)
++ {
++ 	if (key->searchMode == GIN_SEARCH_MODE_EVERYTHING)
++ 	{
++ 		key->boolConsistentFn = trueConsistentFn;
++ 		key->triConsistentFn = trueTriConsistentFn;
++ 	}
++ 	else
++ 	{
++ 		key->consistentFmgrInfo = &ginstate->consistentFn[key->attnum - 1];
++ 		key->collation = ginstate->supportCollation[key->attnum - 1];
++ 		key->boolConsistentFn = normalBoolConsistentFn;
++ 		if (ginstate->consistentSupportMaybe[key->attnum - 1])
++ 			key->triConsistentFn =  normalBoolConsistentFn;
++ 		else
++ 			key->triConsistentFn =  shimTriConsistentFn;
++ 	}
++ }
+diff --git a/src/backend/access/gin/ginutil.c b/src/backend/access/gin/ginutil.c
+new file mode 100644
+index 486f2ef..d561d60
+*** a/src/backend/access/gin/ginutil.c
+--- b/src/backend/access/gin/ginutil.c
+*************** initGinState(GinState *state, Relation i
+*** 67,75 ****
+  		fmgr_info_copy(&(state->extractQueryFn[i]),
+  					   index_getprocinfo(index, i + 1, GIN_EXTRACTQUERY_PROC),
+  					   CurrentMemoryContext);
+! 		fmgr_info_copy(&(state->consistentFn[i]),
+! 					   index_getprocinfo(index, i + 1, GIN_CONSISTENT_PROC),
+! 					   CurrentMemoryContext);
+  
+  		/*
+  		 * Check opclass capability to do partial match.
+--- 67,89 ----
+  		fmgr_info_copy(&(state->extractQueryFn[i]),
+  					   index_getprocinfo(index, i + 1, GIN_EXTRACTQUERY_PROC),
+  					   CurrentMemoryContext);
+! 		/*
+! 		 * Check opclass capability to do tri-state logic consistent check.
+! 		 */
+! 		if (index_getprocid(index, i + 1, GIN_CONSISTENT_TRISTATE_PROC) != InvalidOid)
+! 		{
+! 			fmgr_info_copy(&(state->consistentFn[i]),
+! 			   index_getprocinfo(index, i + 1, GIN_CONSISTENT_TRISTATE_PROC),
+! 						   CurrentMemoryContext);
+! 			state->consistentSupportMaybe[i] = true;
+! 		}
+! 		else
+! 		{
+! 			fmgr_info_copy(&(state->consistentFn[i]),
+! 						   index_getprocinfo(index, i + 1, GIN_CONSISTENT_PROC),
+! 						   CurrentMemoryContext);
+! 			state->consistentSupportMaybe[i] = false;
+! 		}
+  
+  		/*
+  		 * Check opclass capability to do partial match.
+diff --git a/src/backend/utils/adt/tsginidx.c b/src/backend/utils/adt/tsginidx.c
+new file mode 100644
+index 9f6e8e9..c26afb7
+*** a/src/backend/utils/adt/tsginidx.c
+--- b/src/backend/utils/adt/tsginidx.c
+***************
+*** 15,20 ****
+--- 15,21 ----
+  
+  #include "access/gin.h"
+  #include "access/skey.h"
++ #include "miscadmin.h"
+  #include "tsearch/ts_type.h"
+  #include "tsearch/ts_utils.h"
+  #include "utils/builtins.h"
+*************** gin_extract_tsquery(PG_FUNCTION_ARGS)
+*** 172,183 ****
+  typedef struct
+  {
+  	QueryItem  *first_item;
+! 	bool	   *check;
+  	int		   *map_item_operand;
+  	bool	   *need_recheck;
+  } GinChkVal;
+  
+! static bool
+  checkcondition_gin(void *checkval, QueryOperand *val)
+  {
+  	GinChkVal  *gcv = (GinChkVal *) checkval;
+--- 173,184 ----
+  typedef struct
+  {
+  	QueryItem  *first_item;
+! 	GinLogicValue *check;
+  	int		   *map_item_operand;
+  	bool	   *need_recheck;
+  } GinChkVal;
+  
+! static GinLogicValue
+  checkcondition_gin(void *checkval, QueryOperand *val)
+  {
+  	GinChkVal  *gcv = (GinChkVal *) checkval;
+*************** checkcondition_gin(void *checkval, Query
+*** 194,203 ****
+  	return gcv->check[j];
+  }
+  
+  Datum
+  gin_tsquery_consistent(PG_FUNCTION_ARGS)
+  {
+! 	bool	   *check = (bool *) PG_GETARG_POINTER(0);
+  
+  	/* StrategyNumber strategy = PG_GETARG_UINT16(1); */
+  	TSQuery		query = PG_GETARG_TSQUERY(2);
+--- 195,264 ----
+  	return gcv->check[j];
+  }
+  
++ /*
++  * Evaluate tsquery boolean expression.
++  *
++  * chkcond is a callback function used to evaluate each VAL node in the query.
++  * checkval can be used to pass information to the callback. TS_execute doesn't
++  * do anything with it.
++  * if calcnot is false, NOT expressions are always evaluated to be true. This
++  * is used in ranking.
++  */
++ static GinLogicValue
++ TS_execute_tri_state(QueryItem *curitem, void *checkval, bool calcnot,
++ 		GinLogicValue (*chkcond) (void *checkval, QueryOperand *val))
++ {
++ 	GinLogicValue val1, val2, result;
++ 	/* since this function recurses, it could be driven to stack overflow */
++ 	check_stack_depth();
++ 
++ 	if (curitem->type == QI_VAL)
++ 		return chkcond(checkval, (QueryOperand *) curitem);
++ 
++ 	switch (curitem->qoperator.oper)
++ 	{
++ 		case OP_NOT:
++ 			result = TS_execute(curitem + 1, checkval, calcnot, chkcond);
++ 			if (result == GIN_MAYBE)
++ 				return result;
++ 			return !result;
++ 
++ 		case OP_AND:
++ 			val1 = TS_execute(curitem + curitem->qoperator.left, checkval, calcnot, chkcond);
++ 			if (val1 == GIN_FALSE)
++ 				return GIN_FALSE;
++ 			val2 = TS_execute(curitem + 1, checkval, calcnot, chkcond);
++ 			if (val2 == GIN_FALSE)
++ 				return GIN_FALSE;
++ 			if (val1 == GIN_TRUE && val2 == GIN_TRUE)
++ 				return GIN_TRUE;
++ 			else
++ 				return GIN_MAYBE;
++ 
++ 		case OP_OR:
++ 			val1 = TS_execute(curitem + curitem->qoperator.left, checkval, calcnot, chkcond);
++ 			if (val1 == GIN_TRUE)
++ 				return GIN_TRUE;
++ 			val2 = TS_execute(curitem + 1, checkval, calcnot, chkcond);
++ 			if (val2 == GIN_TRUE)
++ 				return GIN_TRUE;
++ 			if (val1 == GIN_FALSE && val2 == GIN_FALSE)
++ 				return GIN_FALSE;
++ 			else
++ 				return GIN_MAYBE;
++ 
++ 		default:
++ 			elog(ERROR, "unrecognized operator: %d", curitem->qoperator.oper);
++ 	}
++ 
++ 	/* not reachable, but keep compiler quiet */
++ 	return false;
++ }
++ 
+  Datum
+  gin_tsquery_consistent(PG_FUNCTION_ARGS)
+  {
+! 	GinLogicValue *check = (bool *) PG_GETARG_POINTER(0);
+  
+  	/* StrategyNumber strategy = PG_GETARG_UINT16(1); */
+  	TSQuery		query = PG_GETARG_TSQUERY(2);
+*************** gin_tsquery_consistent(PG_FUNCTION_ARGS)
+*** 205,211 ****
+  	/* int32	nkeys = PG_GETARG_INT32(3); */
+  	Pointer    *extra_data = (Pointer *) PG_GETARG_POINTER(4);
+  	bool	   *recheck = (bool *) PG_GETARG_POINTER(5);
+! 	bool		res = FALSE;
+  
+  	/* The query requires recheck only if it involves weights */
+  	*recheck = false;
+--- 266,272 ----
+  	/* int32	nkeys = PG_GETARG_INT32(3); */
+  	Pointer    *extra_data = (Pointer *) PG_GETARG_POINTER(4);
+  	bool	   *recheck = (bool *) PG_GETARG_POINTER(5);
+! 	GinLogicValue res = FALSE;
+  
+  	/* The query requires recheck only if it involves weights */
+  	*recheck = false;
+*************** gin_tsquery_consistent(PG_FUNCTION_ARGS)
+*** 224,233 ****
+  		gcv.map_item_operand = (int *) (extra_data[0]);
+  		gcv.need_recheck = recheck;
+  
+! 		res = TS_execute(GETQUERY(query),
+! 						 &gcv,
+! 						 true,
+! 						 checkcondition_gin);
+  	}
+  
+  	PG_RETURN_BOOL(res);
+--- 285,294 ----
+  		gcv.map_item_operand = (int *) (extra_data[0]);
+  		gcv.need_recheck = recheck;
+  
+! 		res = TS_execute_tri_state(GETQUERY(query),
+! 								   &gcv,
+! 								   true,
+! 								   checkcondition_gin);
+  	}
+  
+  	PG_RETURN_BOOL(res);
+diff --git a/src/include/access/gin.h b/src/include/access/gin.h
+new file mode 100644
+index 03e58c9..9c77a0e
+*** a/src/include/access/gin.h
+--- b/src/include/access/gin.h
+***************
+*** 23,29 ****
+  #define GIN_EXTRACTQUERY_PROC		   3
+  #define GIN_CONSISTENT_PROC			   4
+  #define GIN_COMPARE_PARTIAL_PROC	   5
+! #define GINNProcs					   5
+  
+  /*
+   * searchMode settings for extractQueryFn.
+--- 23,30 ----
+  #define GIN_EXTRACTQUERY_PROC		   3
+  #define GIN_CONSISTENT_PROC			   4
+  #define GIN_COMPARE_PARTIAL_PROC	   5
+! #define GIN_CONSISTENT_TRISTATE_PROC   6
+! #define GINNProcs					   6
+  
+  /*
+   * searchMode settings for extractQueryFn.
+*************** typedef struct GinStatsData
+*** 46,51 ****
+--- 47,61 ----
+  	int32		ginVersion;
+  } GinStatsData;
+  
++ enum
++ {
++ 	GIN_FALSE = 0,
++ 	GIN_TRUE = 1,
++ 	GIN_MAYBE = 2
++ } GinLogicValueEnum;
++ 
++ typedef char GinLogicValue;
++ 
+  /* GUC parameter */
+  extern PGDLLIMPORT int GinFuzzySearchLimit;
+  
+diff --git a/src/include/access/gin_private.h b/src/include/access/gin_private.h
+new file mode 100644
+index bb0ab31..864ceb8
+*** a/src/include/access/gin_private.h
+--- b/src/include/access/gin_private.h
+***************
+*** 17,22 ****
+--- 17,24 ----
+  #include "storage/bufmgr.h"
+  #include "utils/rbtree.h"
+  
++ typedef struct GinScanKeyData *GinScanKey;
++ typedef struct GinScanEntryData *GinScanEntry;
+  
+  /*
+   * Page opaque data in an inverted index page.
+*************** typedef struct GinState
+*** 353,358 ****
+--- 355,362 ----
+  	bool		canPartialMatch[INDEX_MAX_KEYS];
+  	/* Collations to pass to the support functions */
+  	Oid			supportCollation[INDEX_MAX_KEYS];
++ 	/* Consistent function supportsunknown values? */
++ 	bool            consistentSupportMaybe[INDEX_MAX_KEYS];
+  } GinState;
+  
+  
+*************** extern OffsetNumber gintuple_get_attrnum
+*** 588,593 ****
+--- 592,601 ----
+  extern Datum gintuple_get_key(GinState *ginstate, IndexTuple tuple,
+  				 GinNullCategory *category);
+  
++ /* ginlogic.c */
++ 
++ extern void GinInitConsistentMethod(GinState *ginstate, GinScanKey key);
++ 
+  /* gininsert.c */
+  extern Datum ginbuild(PG_FUNCTION_ARGS);
+  extern Datum ginbuildempty(PG_FUNCTION_ARGS);
+*************** extern void ginVacuumPostingTreeLeaf(Rel
+*** 732,741 ****
+   * nuserentries is the number that extractQueryFn returned (which is what
+   * we report to consistentFn).	The "user" entries must come first.
+   */
+- typedef struct GinScanKeyData *GinScanKey;
+- 
+- typedef struct GinScanEntryData *GinScanEntry;
+- 
+  typedef struct GinScanKeyData
+  {
+  	/* Real number of entries in scanEntry[] (always > 0) */
+--- 740,745 ----
+*************** typedef struct GinScanKeyData
+*** 748,753 ****
+--- 752,761 ----
+  
+  	/* array of check flags, reported to consistentFn */
+  	bool	   *entryRes;
++ 	bool		(*boolConsistentFn) (GinScanKey key);
++ 	bool		(*triConsistentFn) (GinScanKey key);
++ 	FmgrInfo   *consistentFmgrInfo;
++ 	Oid			collation;
+  
+  	/* other data needed for calling consistentFn */
+  	Datum		query;
+diff --git a/src/include/catalog/pg_am.h b/src/include/catalog/pg_am.h
+new file mode 100644
+index 4f46ddd..759ea70
+*** a/src/include/catalog/pg_am.h
+--- b/src/include/catalog/pg_am.h
+*************** DESCR("hash index access method");
+*** 126,132 ****
+  DATA(insert OID = 783 (  gist		0 8 f t f f t t f t t t f 0 gistinsert gistbeginscan gistgettuple gistgetbitmap gistrescan gistendscan gistmarkpos gistrestrpos gistbuild gistbuildempty gistbulkdelete gistvacuumcleanup - gistcostestimate gistoptions ));
+  DESCR("GiST index access method");
+  #define GIST_AM_OID 783
+! DATA(insert OID = 2742 (  gin		0 5 f f f f t t f f t f f 0 gininsert ginbeginscan - gingetbitmap ginrescan ginendscan ginmarkpos ginrestrpos ginbuild ginbuildempty ginbulkdelete ginvacuumcleanup - gincostestimate ginoptions ));
+  DESCR("GIN index access method");
+  #define GIN_AM_OID 2742
+  DATA(insert OID = 4000 (  spgist	0 5 f f f f f t f t f f f 0 spginsert spgbeginscan spggettuple spggetbitmap spgrescan spgendscan spgmarkpos spgrestrpos spgbuild spgbuildempty spgbulkdelete spgvacuumcleanup spgcanreturn spgcostestimate spgoptions ));
+--- 126,132 ----
+  DATA(insert OID = 783 (  gist		0 8 f t f f t t f t t t f 0 gistinsert gistbeginscan gistgettuple gistgetbitmap gistrescan gistendscan gistmarkpos gistrestrpos gistbuild gistbuildempty gistbulkdelete gistvacuumcleanup - gistcostestimate gistoptions ));
+  DESCR("GiST index access method");
+  #define GIST_AM_OID 783
+! DATA(insert OID = 2742 (  gin		0 6 f f f f t t f f t f f 0 gininsert ginbeginscan - gingetbitmap ginrescan ginendscan ginmarkpos ginrestrpos ginbuild ginbuildempty ginbulkdelete ginvacuumcleanup - gincostestimate ginoptions ));
+  DESCR("GIN index access method");
+  #define GIN_AM_OID 2742
+  DATA(insert OID = 4000 (  spgist	0 5 f f f f f t f t f f f 0 spginsert spgbeginscan spggettuple spggetbitmap spgrescan spgendscan spgmarkpos spgrestrpos spgbuild spgbuildempty spgbulkdelete spgvacuumcleanup spgcanreturn spgcostestimate spgoptions ));
+diff --git a/src/include/catalog/pg_amproc.h b/src/include/catalog/pg_amproc.h
+new file mode 100644
+index 66bd765..636847b
+*** a/src/include/catalog/pg_amproc.h
+--- b/src/include/catalog/pg_amproc.h
+*************** DATA(insert (	3919   3831 3831 7 3881 ))
+*** 234,360 ****
+  DATA(insert (	2745   1007 1007 1	351 ));
+  DATA(insert (	2745   1007 1007 2 2743 ));
+  DATA(insert (	2745   1007 1007 3 2774 ));
+! DATA(insert (	2745   1007 1007 4 2744 ));
+  DATA(insert (	2745   1009 1009 1	360 ));
+  DATA(insert (	2745   1009 1009 2 2743 ));
+  DATA(insert (	2745   1009 1009 3 2774 ));
+! DATA(insert (	2745   1009 1009 4 2744 ));
+  DATA(insert (	2745   1015 1015 1	360 ));
+  DATA(insert (	2745   1015 1015 2 2743 ));
+  DATA(insert (	2745   1015 1015 3 2774 ));
+! DATA(insert (	2745   1015 1015 4 2744 ));
+  DATA(insert (	2745   1023 1023 1 357 ));
+  DATA(insert (	2745   1023 1023 2 2743 ));
+  DATA(insert (	2745   1023 1023 3 2774 ));
+! DATA(insert (	2745   1023 1023 4 2744 ));
+  DATA(insert (	2745   1561 1561 1 1596 ));
+  DATA(insert (	2745   1561 1561 2 2743 ));
+  DATA(insert (	2745   1561 1561 3 2774 ));
+! DATA(insert (	2745   1561 1561 4 2744 ));
+  DATA(insert (	2745   1000 1000 1 1693 ));
+  DATA(insert (	2745   1000 1000 2 2743 ));
+  DATA(insert (	2745   1000 1000 3 2774 ));
+! DATA(insert (	2745   1000 1000 4 2744 ));
+  DATA(insert (	2745   1014 1014 1 1078 ));
+  DATA(insert (	2745   1014 1014 2 2743 ));
+  DATA(insert (	2745   1014 1014 3 2774 ));
+! DATA(insert (	2745   1014 1014 4 2744 ));
+  DATA(insert (	2745   1001 1001 1 1954 ));
+  DATA(insert (	2745   1001 1001 2 2743 ));
+  DATA(insert (	2745   1001 1001 3 2774 ));
+! DATA(insert (	2745   1001 1001 4 2744 ));
+  DATA(insert (	2745   1002 1002 1 358 ));
+  DATA(insert (	2745   1002 1002 2 2743 ));
+  DATA(insert (	2745   1002 1002 3 2774 ));
+! DATA(insert (	2745   1002 1002 4 2744 ));
+  DATA(insert (	2745   1182 1182 1 1092 ));
+  DATA(insert (	2745   1182 1182 2 2743 ));
+  DATA(insert (	2745   1182 1182 3 2774 ));
+! DATA(insert (	2745   1182 1182 4 2744 ));
+  DATA(insert (	2745   1021 1021 1 354 ));
+  DATA(insert (	2745   1021 1021 2 2743 ));
+  DATA(insert (	2745   1021 1021 3 2774 ));
+! DATA(insert (	2745   1021 1021 4 2744 ));
+  DATA(insert (	2745   1022 1022 1 355 ));
+  DATA(insert (	2745   1022 1022 2 2743 ));
+  DATA(insert (	2745   1022 1022 3 2774 ));
+! DATA(insert (	2745   1022 1022 4 2744 ));
+  DATA(insert (	2745   1041 1041 1 926 ));
+  DATA(insert (	2745   1041 1041 2 2743 ));
+  DATA(insert (	2745   1041 1041 3 2774 ));
+! DATA(insert (	2745   1041 1041 4 2744 ));
+  DATA(insert (	2745   651 651 1 926 ));
+  DATA(insert (	2745   651 651 2 2743 ));
+  DATA(insert (	2745   651 651 3 2774 ));
+! DATA(insert (	2745   651 651 4 2744 ));
+  DATA(insert (	2745   1005 1005 1 350 ));
+  DATA(insert (	2745   1005 1005 2 2743 ));
+  DATA(insert (	2745   1005 1005 3 2774 ));
+! DATA(insert (	2745   1005 1005 4 2744 ));
+  DATA(insert (	2745   1016 1016 1 842 ));
+  DATA(insert (	2745   1016 1016 2 2743 ));
+  DATA(insert (	2745   1016 1016 3 2774 ));
+! DATA(insert (	2745   1016 1016 4 2744 ));
+  DATA(insert (	2745   1187 1187 1 1315 ));
+  DATA(insert (	2745   1187 1187 2 2743 ));
+  DATA(insert (	2745   1187 1187 3 2774 ));
+! DATA(insert (	2745   1187 1187 4 2744 ));
+  DATA(insert (	2745   1040 1040 1 836 ));
+  DATA(insert (	2745   1040 1040 2 2743 ));
+  DATA(insert (	2745   1040 1040 3 2774 ));
+! DATA(insert (	2745   1040 1040 4 2744 ));
+  DATA(insert (	2745   1003 1003 1 359 ));
+  DATA(insert (	2745   1003 1003 2 2743 ));
+  DATA(insert (	2745   1003 1003 3 2774 ));
+! DATA(insert (	2745   1003 1003 4 2744 ));
+  DATA(insert (	2745   1231 1231 1 1769 ));
+  DATA(insert (	2745   1231 1231 2 2743 ));
+  DATA(insert (	2745   1231 1231 3 2774 ));
+! DATA(insert (	2745   1231 1231 4 2744 ));
+  DATA(insert (	2745   1028 1028 1 356 ));
+  DATA(insert (	2745   1028 1028 2 2743 ));
+  DATA(insert (	2745   1028 1028 3 2774 ));
+! DATA(insert (	2745   1028 1028 4 2744 ));
+  DATA(insert (	2745   1013 1013 1 404 ));
+  DATA(insert (	2745   1013 1013 2 2743 ));
+  DATA(insert (	2745   1013 1013 3 2774 ));
+! DATA(insert (	2745   1013 1013 4 2744 ));
+  DATA(insert (	2745   1183 1183 1 1107 ));
+  DATA(insert (	2745   1183 1183 2 2743 ));
+  DATA(insert (	2745   1183 1183 3 2774 ));
+! DATA(insert (	2745   1183 1183 4 2744 ));
+  DATA(insert (	2745   1185 1185 1 1314 ));
+  DATA(insert (	2745   1185 1185 2 2743 ));
+  DATA(insert (	2745   1185 1185 3 2774 ));
+! DATA(insert (	2745   1185 1185 4 2744 ));
+  DATA(insert (	2745   1270 1270 1 1358 ));
+  DATA(insert (	2745   1270 1270 2 2743 ));
+  DATA(insert (	2745   1270 1270 3 2774 ));
+! DATA(insert (	2745   1270 1270 4 2744 ));
+  DATA(insert (	2745   1563 1563 1 1672 ));
+  DATA(insert (	2745   1563 1563 2 2743 ));
+  DATA(insert (	2745   1563 1563 3 2774 ));
+! DATA(insert (	2745   1563 1563 4 2744 ));
+  DATA(insert (	2745   1115 1115 1 2045 ));
+  DATA(insert (	2745   1115 1115 2 2743 ));
+  DATA(insert (	2745   1115 1115 3 2774 ));
+! DATA(insert (	2745   1115 1115 4 2744 ));
+  DATA(insert (	2745   791 791 1 377 ));
+  DATA(insert (	2745   791 791 2 2743 ));
+  DATA(insert (	2745   791 791 3 2774 ));
+! DATA(insert (	2745   791 791 4 2744 ));
+  DATA(insert (	2745   1024 1024 1 380 ));
+  DATA(insert (	2745   1024 1024 2 2743 ));
+  DATA(insert (	2745   1024 1024 3 2774 ));
+! DATA(insert (	2745   1024 1024 4 2744 ));
+  DATA(insert (	2745   1025 1025 1 381 ));
+  DATA(insert (	2745   1025 1025 2 2743 ));
+  DATA(insert (	2745   1025 1025 3 2774 ));
+! DATA(insert (	2745   1025 1025 4 2744 ));
+  DATA(insert (	3659   3614 3614 1 3724 ));
+  DATA(insert (	3659   3614 3614 2 3656 ));
+  DATA(insert (	3659   3614 3614 3 3657 ));
+! DATA(insert (	3659   3614 3614 4 3658 ));
+  DATA(insert (	3659   3614 3614 5 2700 ));
+  
+  
+--- 234,360 ----
+  DATA(insert (	2745   1007 1007 1	351 ));
+  DATA(insert (	2745   1007 1007 2 2743 ));
+  DATA(insert (	2745   1007 1007 3 2774 ));
+! DATA(insert (	2745   1007 1007 6 2744 ));
+  DATA(insert (	2745   1009 1009 1	360 ));
+  DATA(insert (	2745   1009 1009 2 2743 ));
+  DATA(insert (	2745   1009 1009 3 2774 ));
+! DATA(insert (	2745   1009 1009 6 2744 ));
+  DATA(insert (	2745   1015 1015 1	360 ));
+  DATA(insert (	2745   1015 1015 2 2743 ));
+  DATA(insert (	2745   1015 1015 3 2774 ));
+! DATA(insert (	2745   1015 1015 6 2744 ));
+  DATA(insert (	2745   1023 1023 1 357 ));
+  DATA(insert (	2745   1023 1023 2 2743 ));
+  DATA(insert (	2745   1023 1023 3 2774 ));
+! DATA(insert (	2745   1023 1023 6 2744 ));
+  DATA(insert (	2745   1561 1561 1 1596 ));
+  DATA(insert (	2745   1561 1561 2 2743 ));
+  DATA(insert (	2745   1561 1561 3 2774 ));
+! DATA(insert (	2745   1561 1561 6 2744 ));
+  DATA(insert (	2745   1000 1000 1 1693 ));
+  DATA(insert (	2745   1000 1000 2 2743 ));
+  DATA(insert (	2745   1000 1000 3 2774 ));
+! DATA(insert (	2745   1000 1000 6 2744 ));
+  DATA(insert (	2745   1014 1014 1 1078 ));
+  DATA(insert (	2745   1014 1014 2 2743 ));
+  DATA(insert (	2745   1014 1014 3 2774 ));
+! DATA(insert (	2745   1014 1014 6 2744 ));
+  DATA(insert (	2745   1001 1001 1 1954 ));
+  DATA(insert (	2745   1001 1001 2 2743 ));
+  DATA(insert (	2745   1001 1001 3 2774 ));
+! DATA(insert (	2745   1001 1001 6 2744 ));
+  DATA(insert (	2745   1002 1002 1 358 ));
+  DATA(insert (	2745   1002 1002 2 2743 ));
+  DATA(insert (	2745   1002 1002 3 2774 ));
+! DATA(insert (	2745   1002 1002 6 2744 ));
+  DATA(insert (	2745   1182 1182 1 1092 ));
+  DATA(insert (	2745   1182 1182 2 2743 ));
+  DATA(insert (	2745   1182 1182 3 2774 ));
+! DATA(insert (	2745   1182 1182 6 2744 ));
+  DATA(insert (	2745   1021 1021 1 354 ));
+  DATA(insert (	2745   1021 1021 2 2743 ));
+  DATA(insert (	2745   1021 1021 3 2774 ));
+! DATA(insert (	2745   1021 1021 6 2744 ));
+  DATA(insert (	2745   1022 1022 1 355 ));
+  DATA(insert (	2745   1022 1022 2 2743 ));
+  DATA(insert (	2745   1022 1022 3 2774 ));
+! DATA(insert (	2745   1022 1022 6 2744 ));
+  DATA(insert (	2745   1041 1041 1 926 ));
+  DATA(insert (	2745   1041 1041 2 2743 ));
+  DATA(insert (	2745   1041 1041 3 2774 ));
+! DATA(insert (	2745   1041 1041 6 2744 ));
+  DATA(insert (	2745   651 651 1 926 ));
+  DATA(insert (	2745   651 651 2 2743 ));
+  DATA(insert (	2745   651 651 3 2774 ));
+! DATA(insert (	2745   651 651 6 2744 ));
+  DATA(insert (	2745   1005 1005 1 350 ));
+  DATA(insert (	2745   1005 1005 2 2743 ));
+  DATA(insert (	2745   1005 1005 3 2774 ));
+! DATA(insert (	2745   1005 1005 6 2744 ));
+  DATA(insert (	2745   1016 1016 1 842 ));
+  DATA(insert (	2745   1016 1016 2 2743 ));
+  DATA(insert (	2745   1016 1016 3 2774 ));
+! DATA(insert (	2745   1016 1016 6 2744 ));
+  DATA(insert (	2745   1187 1187 1 1315 ));
+  DATA(insert (	2745   1187 1187 2 2743 ));
+  DATA(insert (	2745   1187 1187 3 2774 ));
+! DATA(insert (	2745   1187 1187 6 2744 ));
+  DATA(insert (	2745   1040 1040 1 836 ));
+  DATA(insert (	2745   1040 1040 2 2743 ));
+  DATA(insert (	2745   1040 1040 3 2774 ));
+! DATA(insert (	2745   1040 1040 6 2744 ));
+  DATA(insert (	2745   1003 1003 1 359 ));
+  DATA(insert (	2745   1003 1003 2 2743 ));
+  DATA(insert (	2745   1003 1003 3 2774 ));
+! DATA(insert (	2745   1003 1003 6 2744 ));
+  DATA(insert (	2745   1231 1231 1 1769 ));
+  DATA(insert (	2745   1231 1231 2 2743 ));
+  DATA(insert (	2745   1231 1231 3 2774 ));
+! DATA(insert (	2745   1231 1231 6 2744 ));
+  DATA(insert (	2745   1028 1028 1 356 ));
+  DATA(insert (	2745   1028 1028 2 2743 ));
+  DATA(insert (	2745   1028 1028 3 2774 ));
+! DATA(insert (	2745   1028 1028 6 2744 ));
+  DATA(insert (	2745   1013 1013 1 404 ));
+  DATA(insert (	2745   1013 1013 2 2743 ));
+  DATA(insert (	2745   1013 1013 3 2774 ));
+! DATA(insert (	2745   1013 1013 6 2744 ));
+  DATA(insert (	2745   1183 1183 1 1107 ));
+  DATA(insert (	2745   1183 1183 2 2743 ));
+  DATA(insert (	2745   1183 1183 3 2774 ));
+! DATA(insert (	2745   1183 1183 6 2744 ));
+  DATA(insert (	2745   1185 1185 1 1314 ));
+  DATA(insert (	2745   1185 1185 2 2743 ));
+  DATA(insert (	2745   1185 1185 3 2774 ));
+! DATA(insert (	2745   1185 1185 6 2744 ));
+  DATA(insert (	2745   1270 1270 1 1358 ));
+  DATA(insert (	2745   1270 1270 2 2743 ));
+  DATA(insert (	2745   1270 1270 3 2774 ));
+! DATA(insert (	2745   1270 1270 6 2744 ));
+  DATA(insert (	2745   1563 1563 1 1672 ));
+  DATA(insert (	2745   1563 1563 2 2743 ));
+  DATA(insert (	2745   1563 1563 3 2774 ));
+! DATA(insert (	2745   1563 1563 6 2744 ));
+  DATA(insert (	2745   1115 1115 1 2045 ));
+  DATA(insert (	2745   1115 1115 2 2743 ));
+  DATA(insert (	2745   1115 1115 3 2774 ));
+! DATA(insert (	2745   1115 1115 6 2744 ));
+  DATA(insert (	2745   791 791 1 377 ));
+  DATA(insert (	2745   791 791 2 2743 ));
+  DATA(insert (	2745   791 791 3 2774 ));
+! DATA(insert (	2745   791 791 6 2744 ));
+  DATA(insert (	2745   1024 1024 1 380 ));
+  DATA(insert (	2745   1024 1024 2 2743 ));
+  DATA(insert (	2745   1024 1024 3 2774 ));
+! DATA(insert (	2745   1024 1024 6 2744 ));
+  DATA(insert (	2745   1025 1025 1 381 ));
+  DATA(insert (	2745   1025 1025 2 2743 ));
+  DATA(insert (	2745   1025 1025 3 2774 ));
+! DATA(insert (	2745   1025 1025 6 2744 ));
+  DATA(insert (	3659   3614 3614 1 3724 ));
+  DATA(insert (	3659   3614 3614 2 3656 ));
+  DATA(insert (	3659   3614 3614 3 3657 ));
+! DATA(insert (	3659   3614 3614 6 3658 ));
+  DATA(insert (	3659   3614 3614 5 2700 ));
+  
+  
+diff --git a/src/test/regress/expected/opr_sanity.out b/src/test/regress/expected/opr_sanity.out
+new file mode 100644
+index 26abe8a..3b91877
+*** a/src/test/regress/expected/opr_sanity.out
+--- b/src/test/regress/expected/opr_sanity.out
+*************** WHERE p2.opfmethod = p1.oid AND p3.ampro
+*** 1306,1312 ****
+             p4.amproclefttype = p3.amproclefttype AND
+             p4.amprocrighttype = p3.amprocrighttype)
+      NOT BETWEEN
+!       (CASE WHEN p1.amname IN ('btree', 'gist', 'gin') THEN p1.amsupport - 1
+              ELSE p1.amsupport END)
+        AND p1.amsupport;
+   amname | opfname | amproclefttype | amprocrighttype 
+--- 1306,1313 ----
+             p4.amproclefttype = p3.amproclefttype AND
+             p4.amprocrighttype = p3.amprocrighttype)
+      NOT BETWEEN
+!       (CASE WHEN p1.amname IN ('btree', 'gist') THEN p1.amsupport - 1
+!             WHEN p1.amname = 'gin' THEN p1.amsupport - 2
+              ELSE p1.amsupport END)
+        AND p1.amsupport;
+   amname | opfname | amproclefttype | amprocrighttype 
+*************** FROM pg_am am JOIN pg_opclass op ON opcm
+*** 1333,1339 ****
+           amproclefttype = amprocrighttype AND amproclefttype = opcintype
+  WHERE am.amname = 'btree' OR am.amname = 'gist' OR am.amname = 'gin'
+  GROUP BY amname, amsupport, opcname, amprocfamily
+! HAVING (count(*) != amsupport AND count(*) != amsupport - 1)
+      OR amprocfamily IS NULL;
+   amname | opcname | count 
+  --------+---------+-------
+--- 1334,1341 ----
+           amproclefttype = amprocrighttype AND amproclefttype = opcintype
+  WHERE am.amname = 'btree' OR am.amname = 'gist' OR am.amname = 'gin'
+  GROUP BY amname, amsupport, opcname, amprocfamily
+! HAVING (count(*) != amsupport AND count(*) != amsupport - 1 AND
+!        (count(*) != amsupport - 2 OR am.amname <> 'gin'))
+      OR amprocfamily IS NULL;
+   amname | opcname | count 
+  --------+---------+-------
+diff --git a/src/test/regress/sql/opr_sanity.sql b/src/test/regress/sql/opr_sanity.sql
+new file mode 100644
+index 40e1be2..6dd93f9
+*** a/src/test/regress/sql/opr_sanity.sql
+--- b/src/test/regress/sql/opr_sanity.sql
+*************** WHERE p2.opfmethod = p1.oid AND p3.ampro
+*** 1002,1008 ****
+             p4.amproclefttype = p3.amproclefttype AND
+             p4.amprocrighttype = p3.amprocrighttype)
+      NOT BETWEEN
+!       (CASE WHEN p1.amname IN ('btree', 'gist', 'gin') THEN p1.amsupport - 1
+              ELSE p1.amsupport END)
+        AND p1.amsupport;
+  
+--- 1002,1009 ----
+             p4.amproclefttype = p3.amproclefttype AND
+             p4.amprocrighttype = p3.amprocrighttype)
+      NOT BETWEEN
+!       (CASE WHEN p1.amname IN ('btree', 'gist') THEN p1.amsupport - 1
+!             WHEN p1.amname = 'gin' THEN p1.amsupport - 2
+              ELSE p1.amsupport END)
+        AND p1.amsupport;
+  
+*************** FROM pg_am am JOIN pg_opclass op ON opcm
+*** 1024,1030 ****
+           amproclefttype = amprocrighttype AND amproclefttype = opcintype
+  WHERE am.amname = 'btree' OR am.amname = 'gist' OR am.amname = 'gin'
+  GROUP BY amname, amsupport, opcname, amprocfamily
+! HAVING (count(*) != amsupport AND count(*) != amsupport - 1)
+      OR amprocfamily IS NULL;
+  
+  -- Unfortunately, we can't check the amproc link very well because the
+--- 1025,1032 ----
+           amproclefttype = amprocrighttype AND amproclefttype = opcintype
+  WHERE am.amname = 'btree' OR am.amname = 'gist' OR am.amname = 'gin'
+  GROUP BY amname, amsupport, opcname, amprocfamily
+! HAVING (count(*) != amsupport AND count(*) != amsupport - 1 AND
+!        (count(*) != amsupport - 2 OR am.amname <> 'gin'))
+      OR amprocfamily IS NULL;
+  
+  -- Unfortunately, we can't check the amproc link very well because the
