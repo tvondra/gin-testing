@@ -1,0 +1,112 @@
+>From 85e27d2aa08d134e03cb81026111c890c4778fb0 Mon Sep 17 00:00:00 2001
+From: Heikki Linnakangas <heikki.linnakangas@iki.fi>
+Date: Thu, 23 Jan 2014 15:47:54 +0200
+Subject: [PATCH 2/4] Further optimize the multi-key GIN searches.
+
+If we're skipping past a certain TID, avoid decoding posting list segments
+that only contain smaller TIDs.
+---
+ src/backend/access/gin/gindatapage.c | 32 +++++++++++++++++++++++++++++---
+ src/backend/access/gin/ginget.c      |  6 ++++--
+ src/include/access/gin_private.h     |  2 +-
+ 3 files changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/src/backend/access/gin/gindatapage.c b/src/backend/access/gin/gindatapage.c
+index 91934f0..534dae3 100644
+--- a/src/backend/access/gin/gindatapage.c
++++ b/src/backend/access/gin/gindatapage.c
+@@ -97,18 +97,44 @@ static void dataPlaceToPageLeafSplit(Buffer buf,
+ 
+ /*
+  * Read all TIDs from leaf data page to single uncompressed array.
++ *
++ * If advancePast is valid, the caller is only interested in TIDs > advancePast.
++ * This function can still return items smaller than that, so the caller
++ * must still check them, but passing it allows this function to skip some
++ * items as an optimization.
+  */
+ ItemPointer
+-GinDataLeafPageGetItems(Page page, int *nitems)
++GinDataLeafPageGetItems(Page page, int *nitems, ItemPointerData advancePast)
+ {
+ 	ItemPointer result;
+ 
+ 	if (GinPageIsCompressed(page))
+ 	{
+-		GinPostingList *ptr = GinDataLeafPageGetPostingList(page);
++		GinPostingList *seg = GinDataLeafPageGetPostingList(page);
+ 		Size		len = GinDataLeafPageGetPostingListSize(page);
++		Pointer		endptr = ((Pointer) seg) + len;
++		GinPostingList *next;
+ 
+-		result = ginPostingListDecodeAllSegments(ptr, len, nitems);
++		/* Skip to the segment containing advancePast+1 */
++		if (ItemPointerIsValid(&advancePast))
++		{
++			next = GinNextPostingListSegment(seg);
++			while ((Pointer) next < endptr &&
++				   ginCompareItemPointers(&next->first, &advancePast) <= 0)
++			{
++				seg = next;
++				next = GinNextPostingListSegment(seg);
++			}
++			len = endptr - (Pointer) seg;
++		}
++
++		if (len > 0)
++			result = ginPostingListDecodeAllSegments(seg, len, nitems);
++		else
++		{
++			result = palloc(0);
++			*nitems = 0;
++		}
+ 	}
+ 	else
+ 	{
+diff --git a/src/backend/access/gin/ginget.c b/src/backend/access/gin/ginget.c
+index 4e4b51a..e303700 100644
+--- a/src/backend/access/gin/ginget.c
++++ b/src/backend/access/gin/ginget.c
+@@ -400,6 +400,7 @@ restartScanEntry:
+ 			BlockNumber rootPostingTree = GinGetPostingTree(itup);
+ 			GinBtreeStack *stack;
+ 			Page		page;
++			ItemPointerData minItem;
+ 
+ 			/*
+ 			 * We should unlock entry page before touching posting tree to
+@@ -426,7 +427,8 @@ restartScanEntry:
+ 			/*
+ 			 * Load the first page into memory.
+ 			 */
+-			entry->list = GinDataLeafPageGetItems(page, &entry->nlist);
++			ItemPointerSetMin(&minItem);
++			entry->list = GinDataLeafPageGetItems(page, &entry->nlist, minItem);
+ 
+ 			entry->predictNumberResult = stack->predictNumber * entry->nlist;
+ 
+@@ -556,7 +558,7 @@ entryLoadMoreItems(GinState *ginstate, GinScanEntry entry, ItemPointerData advan
+ 			continue;
+ 		}
+ 
+-		entry->list = GinDataLeafPageGetItems(page, &entry->nlist);
++		entry->list = GinDataLeafPageGetItems(page, &entry->nlist, advancePast);
+ 
+ 		for (i = 0; i < entry->nlist; i++)
+ 		{
+diff --git a/src/include/access/gin_private.h b/src/include/access/gin_private.h
+index 3f92c37..8c350b9 100644
+--- a/src/include/access/gin_private.h
++++ b/src/include/access/gin_private.h
+@@ -692,7 +692,7 @@ extern ItemPointer ginReadTuple(GinState *ginstate, OffsetNumber attnum,
+ 			 IndexTuple itup, int *nitems);
+ 
+ /* gindatapage.c */
+-extern ItemPointer GinDataLeafPageGetItems(Page page, int *nitems);
++extern ItemPointer GinDataLeafPageGetItems(Page page, int *nitems, ItemPointerData advancePast);
+ extern int GinDataLeafPageGetItemsToTbm(Page page, TIDBitmap *tbm);
+ extern BlockNumber createPostingTree(Relation index,
+ 				  ItemPointerData *items, uint32 nitems,
+-- 
+1.8.5.2
+

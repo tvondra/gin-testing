@@ -1,0 +1,49 @@
+diff --git a/src/backend/access/gin/ginget.c b/src/backend/access/gin/ginget.c
+index f2f9dc6..76a70a0 100644
+--- a/src/backend/access/gin/ginget.c
++++ b/src/backend/access/gin/ginget.c
+@@ -895,6 +895,25 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
+ 								GinItemPointerGetBlockNumber(&minItem));
+ 
+ 		/*
++		 * We might not have loaded all the entry streams for this TID. We
++		 * could call the consistent function, passing MAYBE for those entries,
++		 * to see if it can decide if this TID matches based on the information
++		 * we have. But if the consistent-function is expensive, and cannot
++		 * in fact decide with partial information, that could be a big loss.
++		 * So, loop back to load the missing entries, before calling the
++		 * consistent function.
++		 */
++		if (minUnknown != -1)
++		{
++			for (i = minUnknown; i < key->nentries; i++)
++			{
++				entry = key->scanEntry[i];
++				if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
++					entryGetItem(ginstate, entry, advancePast);
++			}
++		}
++
++		/*
+ 		 * Lossy-page entries pose a problem, since we don't know the correct
+ 		 * entryRes state to pass to the consistentFn, and we also don't know
+ 		 * what its combining logic will be (could be AND, OR, or even NOT).
+@@ -996,18 +1015,6 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
+ 				break;
+ 
+ 			case GIN_MAYBE:
+-				/*
+-				 * The consistent function cannot decide with the information
+-				 * we've got. If there are any "unknown" sources left, advance
+-				 * one of them and try again, in the hope that it can decide
+-				 * with the extra information.
+-				 */
+-				if (minUnknown != -1)
+-				{
+-					entry = key->scanEntry[minUnknown];
+-					entryGetItem(ginstate, entry, advancePast);
+-					continue;
+-				}
+ 				key->curItemMatches = true;
+ 				key->recheckCurItem = true;
+ 				break;

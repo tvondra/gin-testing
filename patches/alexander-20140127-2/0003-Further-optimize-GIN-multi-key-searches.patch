@@ -1,0 +1,198 @@
+>From 13792c0d32fc97f2b0a4ff6543858f0ef0d8c2a7 Mon Sep 17 00:00:00 2001
+From: Heikki Linnakangas <heikki.linnakangas@iki.fi>
+Date: Thu, 23 Jan 2014 16:55:51 +0200
+Subject: [PATCH 3/4] Further optimize GIN multi-key searches.
+
+When skipping over some items in a posting tree, re-find the new location
+by descending the tree from root, rather than walking the right links.
+This can save a lot of I/O.
+---
+ src/backend/access/gin/gindatapage.c |  9 ++--
+ src/backend/access/gin/ginget.c      | 90 +++++++++++++++++++++++++++---------
+ src/include/access/gin_private.h     |  3 +-
+ 3 files changed, 75 insertions(+), 27 deletions(-)
+
+diff --git a/src/backend/access/gin/gindatapage.c b/src/backend/access/gin/gindatapage.c
+index 534dae3..2f86c6a 100644
+--- a/src/backend/access/gin/gindatapage.c
++++ b/src/backend/access/gin/gindatapage.c
+@@ -1635,16 +1635,15 @@ ginInsertItemPointers(Relation index, BlockNumber rootBlkno,
+  * Starts a new scan on a posting tree.
+  */
+ GinBtreeStack *
+-ginScanBeginPostingTree(Relation index, BlockNumber rootBlkno)
++ginScanBeginPostingTree(GinBtree btree, Relation index, BlockNumber rootBlkno)
+ {
+-	GinBtreeData btree;
+ 	GinBtreeStack *stack;
+ 
+-	ginPrepareDataScan(&btree, index, rootBlkno);
++	ginPrepareDataScan(btree, index, rootBlkno);
+ 
+-	btree.fullScan = TRUE;
++	btree->fullScan = TRUE;
+ 
+-	stack = ginFindLeafPage(&btree, TRUE);
++	stack = ginFindLeafPage(btree, TRUE);
+ 
+ 	return stack;
+ }
+diff --git a/src/backend/access/gin/ginget.c b/src/backend/access/gin/ginget.c
+index e303700..4285a03 100644
+--- a/src/backend/access/gin/ginget.c
++++ b/src/backend/access/gin/ginget.c
+@@ -99,12 +99,13 @@ static void
+ scanPostingTree(Relation index, GinScanEntry scanEntry,
+ 				BlockNumber rootPostingTree)
+ {
++	GinBtreeData btree;
+ 	GinBtreeStack *stack;
+ 	Buffer		buffer;
+ 	Page		page;
+ 
+ 	/* Descend to the leftmost leaf page */
+-	stack = ginScanBeginPostingTree(index, rootPostingTree);
++	stack = ginScanBeginPostingTree(&btree, index, rootPostingTree);
+ 	buffer = stack->buffer;
+ 	IncrBufferRefCount(buffer); /* prevent unpin in freeGinBtreeStack */
+ 
+@@ -412,7 +413,8 @@ restartScanEntry:
+ 			LockBuffer(stackEntry->buffer, GIN_UNLOCK);
+ 			needUnlock = FALSE;
+ 
+-			stack = ginScanBeginPostingTree(ginstate->index, rootPostingTree);
++			stack = ginScanBeginPostingTree(&entry->btree, ginstate->index,
++											rootPostingTree);
+ 			entry->buffer = stack->buffer;
+ 
+ 			/*
+@@ -506,8 +508,50 @@ entryLoadMoreItems(GinState *ginstate, GinScanEntry entry, ItemPointerData advan
+ {
+ 	Page		page;
+ 	int			i;
++	bool		stepright;
++
++	/*
++	 * We have two strategies for finding the correct page: step right from
++	 * the current page, or descend the tree again from the root. If
++	 * advancePast equals the current item, the next matching item should be
++	 * on the next page, so we step right. Otherwise, descend from root.
++	 */
++	if (ginCompareItemPointers(&entry->curItem, &advancePast) == 0)
++	{
++		stepright = true;
++		LockBuffer(entry->buffer, GIN_SHARE);
++	}
++	else
++	{
++		GinBtreeStack *stack;
++
++		ReleaseBuffer(entry->buffer);
++
++		/*
++		 * Set the search key, and find the correct leaf page.
++		 *
++		 * XXX: This is off by one, we're searching for an item > advancePast,
++		 * but we're asking the tree for the next item >= advancePast. It only
++		 * makes a difference in the corner case that advancePast is the
++		 * right bound of a page, in which case we'll scan one page
++		 * unnecessarily. Other than that it's harmless.
++		 */
++		entry->btree.itemptr = advancePast;
++		entry->btree.fullScan = false;
++		stack = ginFindLeafPage(&entry->btree, true);
++
++		/* we don't need the stack, just the buffer. */
++		entry->buffer = stack->buffer;
++		IncrBufferRefCount(entry->buffer);
++		freeGinBtreeStack(stack);
++		stepright = false;
++	}
++
++	elog(DEBUG2, "entryLoadMoreItems, %u/%u, skip: %d",
++		 GinItemPointerGetBlockNumber(&advancePast),
++		 GinItemPointerGetOffsetNumber(&advancePast),
++		 !stepright);
+ 
+-	LockBuffer(entry->buffer, GIN_SHARE);
+ 	page = BufferGetPage(entry->buffer);
+ 	for (;;)
+ 	{
+@@ -519,31 +563,35 @@ entryLoadMoreItems(GinState *ginstate, GinScanEntry entry, ItemPointerData advan
+ 			entry->nlist = 0;
+ 		}
+ 
+-		/*
+-		 * We've processed all the entries on this page. If it was the last
+-		 * page in the tree, we're done.
+-		 */
+-		if (GinPageRightMost(page))
++		if (stepright)
+ 		{
+-			UnlockReleaseBuffer(entry->buffer);
+-			entry->buffer = InvalidBuffer;
+-			entry->isFinished = TRUE;
+-			return;
++			/*
++			 * We've processed all the entries on this page. If it was the last
++			 * page in the tree, we're done.
++			 */
++			if (GinPageRightMost(page))
++			{
++				UnlockReleaseBuffer(entry->buffer);
++				entry->buffer = InvalidBuffer;
++				entry->isFinished = TRUE;
++				return;
++			}
++
++			/*
++			 * Step to next page, following the right link. then find the first
++			 * ItemPointer greater than advancePast.
++			 */
++			entry->buffer = ginStepRight(entry->buffer,
++										 ginstate->index,
++										 GIN_SHARE);
++			page = BufferGetPage(entry->buffer);
+ 		}
++		stepright = true;
+ 
+ 		if (GinPageGetOpaque(page)->flags & GIN_DELETED)
+ 			continue;		/* page was deleted by concurrent vacuum */
+ 
+ 		/*
+-		 * Step to next page, following the right link. then find the first
+-		 * ItemPointer greater than advancePast.
+-		 */
+-		entry->buffer = ginStepRight(entry->buffer,
+-									 ginstate->index,
+-									 GIN_SHARE);
+-		page = BufferGetPage(entry->buffer);
+-
+-		/*
+ 		 * The first item > advancePast might not be on this page, but
+ 		 * somewhere to the right, if the page was split. Keep following
+ 		 * the right-links until we re-find the correct page.
+diff --git a/src/include/access/gin_private.h b/src/include/access/gin_private.h
+index 8c350b9..a12dfc3 100644
+--- a/src/include/access/gin_private.h
++++ b/src/include/access/gin_private.h
+@@ -703,7 +703,7 @@ extern void GinPageDeletePostingItem(Page page, OffsetNumber offset);
+ extern void ginInsertItemPointers(Relation index, BlockNumber rootBlkno,
+ 					  ItemPointerData *items, uint32 nitem,
+ 					  GinStatsData *buildStats);
+-extern GinBtreeStack *ginScanBeginPostingTree(Relation index, BlockNumber rootBlkno);
++extern GinBtreeStack *ginScanBeginPostingTree(GinBtree btree, Relation index, BlockNumber rootBlkno);
+ extern void ginDataFillRoot(GinBtree btree, Page root, BlockNumber lblkno, Page lpage, BlockNumber rblkno, Page rpage);
+ extern void ginPrepareDataScan(GinBtree btree, Relation index, BlockNumber rootBlkno);
+ 
+@@ -803,6 +803,7 @@ typedef struct GinScanEntryData
+ 	bool		isFinished;
+ 	bool		reduceResult;
+ 	uint32		predictNumberResult;
++	GinBtreeData btree;
+ }	GinScanEntryData;
+ 
+ typedef struct GinScanOpaqueData
+-- 
+1.8.5.2
+

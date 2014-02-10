@@ -1,0 +1,22 @@
+diff --git a/src/backend/access/gin/gindatapage.c b/src/backend/access/gin/gindatapage.c
+new file mode 100644
+index 8504f4c..4be5b3c
+*** a/src/backend/access/gin/gindatapage.c
+--- b/src/backend/access/gin/gindatapage.c
+*************** dataPlaceToPageLeafRecompress(Buffer buf
+*** 802,808 ****
+  		ptr += segsize;
+  		newsize += segsize;
+  	}
+! 	Assert(newsize < GinDataLeafMaxContentSize);
+  	GinDataLeafPageSetPostingListSize(page, newsize);
+  	GinPageSetCompressed(page);	 /* in case it was in pre-9.4 format before */
+  
+--- 802,808 ----
+  		ptr += segsize;
+  		newsize += segsize;
+  	}
+! 	Assert(newsize <= GinDataLeafMaxContentSize);
+  	GinDataLeafPageSetPostingListSize(page, newsize);
+  	GinPageSetCompressed(page);	 /* in case it was in pre-9.4 format before */
+  

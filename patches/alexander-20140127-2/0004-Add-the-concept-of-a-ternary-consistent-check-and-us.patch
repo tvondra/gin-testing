@@ -1,0 +1,752 @@
+>From c9087c8d5d3501deceb433966206d4d69e135042 Mon Sep 17 00:00:00 2001
+From: Heikki Linnakangas <heikki.linnakangas@iki.fi>
+Date: Thu, 23 Jan 2014 23:08:43 +0200
+Subject: [PATCH 4/4] Add the concept of a ternary consistent check, and use it
+ to skip entries.
+
+When we have loaded the next item from some, but not all, entries in a scan,
+it might be possible to prove that there cannot be any matches with smaller
+item pointer coming from the other entries. In that case, we can
+fast-forward those entries to the smallest item among the already-fetched
+sources.
+
+There is no support for opclass-defined ternary consistent functions yet,
+but there is a shim function that calls the regular, boolean, consistent
+function "both ways", when only one input is unknown.
+
+Per the concept by Alexander Korotkov
+---
+ src/backend/access/gin/Makefile   |   2 +-
+ src/backend/access/gin/ginget.c   | 414 ++++++++++++++++++++++----------------
+ src/backend/access/gin/ginlogic.c | 136 +++++++++++++
+ src/include/access/gin_private.h  |  23 ++-
+ 4 files changed, 397 insertions(+), 178 deletions(-)
+ create mode 100644 src/backend/access/gin/ginlogic.c
+
+diff --git a/src/backend/access/gin/Makefile b/src/backend/access/gin/Makefile
+index aabc62f..db4f496 100644
+--- a/src/backend/access/gin/Makefile
++++ b/src/backend/access/gin/Makefile
+@@ -14,6 +14,6 @@ include $(top_builddir)/src/Makefile.global
+ 
+ OBJS = ginutil.o gininsert.o ginxlog.o ginentrypage.o gindatapage.o \
+ 	ginbtree.o ginscan.o ginget.o ginvacuum.o ginarrayproc.o \
+-	ginbulk.o ginfast.o ginpostinglist.o
++	ginbulk.o ginfast.o ginpostinglist.o ginlogic.o
+ 
+ include $(top_srcdir)/src/backend/common.mk
+diff --git a/src/backend/access/gin/ginget.c b/src/backend/access/gin/ginget.c
+index 4285a03..f2f9dc6 100644
+--- a/src/backend/access/gin/ginget.c
++++ b/src/backend/access/gin/ginget.c
+@@ -32,41 +32,6 @@ typedef struct pendingPosition
+ 	bool	   *hasMatchKey;
+ } pendingPosition;
+ 
+-
+-/*
+- * Convenience function for invoking a key's consistentFn
+- */
+-static bool
+-callConsistentFn(GinState *ginstate, GinScanKey key)
+-{
+-	/*
+-	 * If we're dealing with a dummy EVERYTHING key, we don't want to call the
+-	 * consistentFn; just claim it matches.
+-	 */
+-	if (key->searchMode == GIN_SEARCH_MODE_EVERYTHING)
+-	{
+-		key->recheckCurItem = false;
+-		return true;
+-	}
+-
+-	/*
+-	 * Initialize recheckCurItem in case the consistentFn doesn't know it
+-	 * should set it.  The safe assumption in that case is to force recheck.
+-	 */
+-	key->recheckCurItem = true;
+-
+-	return DatumGetBool(FunctionCall8Coll(&ginstate->consistentFn[key->attnum - 1],
+-								 ginstate->supportCollation[key->attnum - 1],
+-										  PointerGetDatum(key->entryRes),
+-										  UInt16GetDatum(key->strategy),
+-										  key->query,
+-										  UInt32GetDatum(key->nuserentries),
+-										  PointerGetDatum(key->extra_data),
+-									   PointerGetDatum(&key->recheckCurItem),
+-										  PointerGetDatum(key->queryValues),
+-									 PointerGetDatum(key->queryCategories)));
+-}
+-
+ /*
+  * Goes to the next page if current offset is outside of bounds
+  */
+@@ -460,6 +425,8 @@ startScanKey(GinState *ginstate, GinScanKey key)
+ 	key->curItemMatches = false;
+ 	key->recheckCurItem = false;
+ 	key->isFinished = false;
++
++	GinInitConsistentMethod(ginstate, key);
+ }
+ 
+ static void
+@@ -789,18 +756,19 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
+ 	ItemPointerData minItem;
+ 	ItemPointerData curPageLossy;
+ 	uint32		i;
+-	uint32		lossyEntry;
+ 	bool		haveLossyEntry;
+ 	GinScanEntry entry;
+-	bool		res;
+ 	MemoryContext oldCtx;
+ 	bool		allFinished;
++	bool		allUnknown;
++	int			minUnknown;
++	GinLogicValue res;
+ 
+ 	Assert(!key->isFinished);
+ 
+ 	/*
+ 	 * We might have already tested this item; if so, no need to repeat work.
+-	 * (Note: the ">" case can happen, if minItem is exact but we previously
++	 * (Note: the ">" case can happen, if advancePast is exact but we previously
+ 	 * had to set curItem to a lossy-page pointer.)
+ 	 */
+ 	if (ginCompareItemPointers(&key->curItem, &advancePast) > 0)
+@@ -814,155 +782,256 @@ keyGetItem(GinState *ginstate, MemoryContext tempCtx, GinScanKey key,
+ 	 * same page.  So we'll prefer to return exact pointers not lossy
+ 	 * pointers, which is good.
+ 	 */
+-	ItemPointerSetMax(&minItem);
+-	allFinished = true;
+-	for (i = 0; i < key->nentries; i++)
++	oldCtx = CurrentMemoryContext;
++
++	for (;;)
+ 	{
+-		entry = key->scanEntry[i];
++		ItemPointerSetMax(&minItem);
++		allFinished = true;
++		allUnknown = true;
++		minUnknown = -1;
++		for (i = 0; i < key->nentries; i++)
++		{
++			entry = key->scanEntry[i];
+ 
+-		/*
+-		 * Advance this stream if necessary.
+-		 *
+-		 * In particular, since entry->curItem was initialized with
+-		 * ItemPointerSetMin, this ensures we fetch the first item for each
+-		 * entry on the first call.
+-		 */
+-		while (entry->isFinished == FALSE &&
+-			   ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
++			if (entry->isFinished)
++				continue;
++			allFinished = false;
++
++			if (!entry->isFinished &&
++				ginCompareItemPointers(&entry->curItem, &advancePast) > 0)
++			{
++				allUnknown = false;
++				if (ginCompareItemPointers(&entry->curItem, &minItem) < 0)
++					minItem = entry->curItem;
++			}
++			else if (minUnknown == -1)
++				minUnknown = i;
++		}
++
++		if (allFinished)
+ 		{
+-			entryGetItem(ginstate, entry, advancePast);
++			/* all entries are finished */
++			key->isFinished = TRUE;
++			return;
+ 		}
+ 
+-		if (!entry->isFinished)
++		if (allUnknown)
+ 		{
+-			allFinished = FALSE;
+-			if (ginCompareItemPointers(&entry->curItem, &minItem) < 0)
+-				minItem = entry->curItem;
++			/*
++			 * We must have an item from at least one source to have a match.
++			 * Fetch the next item > advancePast from the first (non-finished)
++			 * entry stream.
++			 */
++			entry = key->scanEntry[minUnknown];
++			entryGetItem(ginstate, entry, advancePast);
++			continue;
+ 		}
+-	}
+ 
+-	if (allFinished)
+-	{
+-		/* all entries are finished */
+-		key->isFinished = TRUE;
+-		return;
+-	}
++		/*
++		 * We now have minItem set to the minimum among input streams *that*
++		 * we know. Some streams might be in unknown state, meaning we don't
++		 * know the next value from that input.
++		 *
++		 * Determine if any items between advancePast and minItem might match.
++		 * Such items might come from one of the unknown sources, but it's
++		 * possible that the consistent function can refute them all, ie. 
++		 * the consistent logic says that they cannot match without any of the
++		 * sources that we have loaded.
++		 */
++		if (minUnknown != -1)
++		{
++			for (i = 0; i < key->nentries; i++)
++			{
++				entry = key->scanEntry[i];
++				if (entry->isFinished)
++					key->entryRes[i] = GIN_FALSE;
++				else if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
++				{
++					/* this source is 'unloaded' */
++					key->entryRes[i] = GIN_MAYBE;
++				}
++				else
++				{
++					/*
++					 * we know the next item from this source to be >= minItem,
++					 * hence it's false for any items before < minItem
++					 */
++					key->entryRes[i] = GIN_FALSE;
++				}
++			}
+ 
+-	/*
+-	 * OK, set key->curItem and perform consistentFn test.
+-	 */
+-	key->curItem = minItem;
++			MemoryContextSwitchTo(tempCtx);
++			res = key->triConsistentFn(key);
++			MemoryContextSwitchTo(oldCtx);
+ 
+-	/*
+-	 * Lossy-page entries pose a problem, since we don't know the correct
+-	 * entryRes state to pass to the consistentFn, and we also don't know what
+-	 * its combining logic will be (could be AND, OR, or even NOT). If the
+-	 * logic is OR then the consistentFn might succeed for all items in the
+-	 * lossy page even when none of the other entries match.
+-	 *
+-	 * If we have a single lossy-page entry then we check to see if the
+-	 * consistentFn will succeed with only that entry TRUE.  If so, we return
+-	 * a lossy-page pointer to indicate that the whole heap page must be
+-	 * checked.  (On subsequent calls, we'll do nothing until minItem is past
+-	 * the page altogether, thus ensuring that we never return both regular
+-	 * and lossy pointers for the same page.)
+-	 *
+-	 * This idea could be generalized to more than one lossy-page entry, but
+-	 * ideally lossy-page entries should be infrequent so it would seldom be
+-	 * the case that we have more than one at once.  So it doesn't seem worth
+-	 * the extra complexity to optimize that case. If we do find more than
+-	 * one, we just punt and return a lossy-page pointer always.
+-	 *
+-	 * Note that only lossy-page entries pointing to the current item's page
+-	 * should trigger this processing; we might have future lossy pages in the
+-	 * entry array, but they aren't relevant yet.
+-	 */
+-	ItemPointerSetLossyPage(&curPageLossy,
+-							GinItemPointerGetBlockNumber(&key->curItem));
++			if (res == GIN_FALSE)
++			{
++				/*
++				 * All items between advancePast and minItem have been refuted.
++				 * Proceed with minItem.
++				 */
++				advancePast = minItem;
++				advancePast.ip_posid--;
++			}
++			else
++			{
++				/*
++				 * There might be matches smaller than minItem coming from one
++				 * of the unknown sources. Load more items, and retry.
++				 */
++				entry = key->scanEntry[minUnknown];
++				entryGetItem(ginstate, entry, advancePast);
++				continue;
++			}
++		}
+ 
+-	lossyEntry = 0;
+-	haveLossyEntry = false;
+-	for (i = 0; i < key->nentries; i++)
+-	{
+-		entry = key->scanEntry[i];
+-		if (entry->isFinished == FALSE &&
+-			ginCompareItemPointers(&entry->curItem, &curPageLossy) == 0)
++		/*
++		 * Ok, we now know that there are no matches < minItem. Proceed to
++		 * check if it's a match.
++		 */
++		key->curItem = minItem;
++		ItemPointerSetLossyPage(&curPageLossy,
++								GinItemPointerGetBlockNumber(&minItem));
++
++		/*
++		 * Lossy-page entries pose a problem, since we don't know the correct
++		 * entryRes state to pass to the consistentFn, and we also don't know
++		 * what its combining logic will be (could be AND, OR, or even NOT).
++		 * If the logic is OR then the consistentFn might succeed for all items
++		 * in the lossy page even when none of the other entries match.
++		 *
++		 * Our strategy is to call the tri-state consistent function, with the
++		 * lossy-page entries set to MAYBE, and all the other entries FALSE.
++		 * If it returns FALSE, none of the lossy items alone are enough for a
++		 * match, so we don't need to return a lossy-page pointer. Otherwise,
++		 * return a lossy-page pointer to indicate that the whole heap page must
++		 * be checked.  (On subsequent calls, we'll do nothing until minItem is
++		 * past the page altogether, thus ensuring that we never return both
++		 * regular and lossy pointers for the same page.)
++		 *
++		 * An exception is that we don't need to try it both ways (ie. pass
++		 * MAYBE) if the lossy pointer is in a "hidden" entry, because the
++		 * consistentFn's result can't depend on that (but mark the result as
++		 * 'recheck').
++		 *
++		 * Note that only lossy-page entries pointing to the current item's
++		 * page should trigger this processing; we might have future lossy
++		 * pages in the entry array, but they aren't relevant yet.
++		 */
++		haveLossyEntry = false;
++		for (i = 0; i < key->nentries; i++)
+ 		{
+-			if (haveLossyEntry)
++			entry = key->scanEntry[i];
++			if (entry->isFinished == FALSE &&
++				ginCompareItemPointers(&entry->curItem, &curPageLossy) == 0)
+ 			{
+-				/* Multiple lossy entries, punt */
++				key->entryRes[i] = GIN_MAYBE;
++				haveLossyEntry = true;
++			}
++			else
++				key->entryRes[i] = GIN_FALSE;
++		}
++
++		if (haveLossyEntry)
++		{
++			MemoryContextSwitchTo(tempCtx);
++			res = key->triConsistentFn(key);
++			MemoryContextSwitchTo(oldCtx);
++
++			if (res == GIN_TRUE || res == GIN_MAYBE)
++			{
++				/* Some of the lossy items on the heap page might match, punt */
+ 				key->curItem = curPageLossy;
+ 				key->curItemMatches = true;
+ 				key->recheckCurItem = true;
+ 				return;
+ 			}
+-			lossyEntry = i;
+-			haveLossyEntry = true;
+ 		}
+-	}
+ 
+-	/* prepare for calling consistentFn in temp context */
+-	oldCtx = MemoryContextSwitchTo(tempCtx);
++		/*
++		 * Let's call the consistent function to check if this is a match.
++		 *
++		 * At this point we know that we don't need to return a lossy
++		 * whole-page pointer, but we might have matches for individual exact
++		 * item pointers, possibly in combination with a lossy pointer. Pass
++		 * lossy pointers as MAYBE to the ternary consistent function, to
++		 * let it decide if this tuple satisfies the overall key, even though
++		 * we don't know whether the lossy entries match.
++		 *
++		 * We might also not have advanced all the entry streams up to this
++		 * point yet. It's possible that the consistent function can
++		 * nevertheless decide that this is definitely a match or not a match,
++		 * even though we don't know if those unknown entries match, so we
++		 * pass them as MAYBE.
++		 */
++		for (i = 0; i < key->nentries; i++)
++		{
++			entry = key->scanEntry[i];
++			if (entry->isFinished)
++				key->entryRes[i] = GIN_FALSE;
++			else if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
++				key->entryRes[i] = GIN_MAYBE; /* not loaded yet */
++			else if (ginCompareItemPointers(&entry->curItem, &curPageLossy) == 0)
++				key->entryRes[i] = GIN_MAYBE;
++			else if (ginCompareItemPointers(&entry->curItem, &minItem) == 0)
++				key->entryRes[i] = GIN_TRUE;
++			else
++				key->entryRes[i] = GIN_FALSE;
++		}
+ 
+-	if (haveLossyEntry)
+-	{
+-		/* Single lossy-page entry, so see if whole page matches */
+-		memset(key->entryRes, FALSE, key->nentries);
+-		key->entryRes[lossyEntry] = TRUE;
++		MemoryContextSwitchTo(tempCtx);
++		res = key->triConsistentFn(key);
++		MemoryContextSwitchTo(oldCtx);
+ 
+-		if (callConsistentFn(ginstate, key))
++		switch (res)
+ 		{
+-			/* Yes, so clean up ... */
+-			MemoryContextSwitchTo(oldCtx);
+-			MemoryContextReset(tempCtx);
+-
+-			/* and return lossy pointer for whole page */
+-			key->curItem = curPageLossy;
+-			key->curItemMatches = true;
+-			key->recheckCurItem = true;
+-			return;
+-		}
+-	}
++			case GIN_TRUE:
++				key->curItemMatches = true;
++				/* triConsistentFn set recheckCurItem */
++				break;
+ 
+-	/*
+-	 * At this point we know that we don't need to return a lossy whole-page
+-	 * pointer, but we might have matches for individual exact item pointers,
+-	 * possibly in combination with a lossy pointer.  Our strategy if there's
+-	 * a lossy pointer is to try the consistentFn both ways and return a hit
+-	 * if it accepts either one (forcing the hit to be marked lossy so it will
+-	 * be rechecked).  An exception is that we don't need to try it both ways
+-	 * if the lossy pointer is in a "hidden" entry, because the consistentFn's
+-	 * result can't depend on that.
+-	 *
+-	 * Prepare entryRes array to be passed to consistentFn.
+-	 */
+-	for (i = 0; i < key->nentries; i++)
+-	{
+-		entry = key->scanEntry[i];
+-		if (entry->isFinished == FALSE &&
+-			ginCompareItemPointers(&entry->curItem, &key->curItem) == 0)
+-			key->entryRes[i] = TRUE;
+-		else
+-			key->entryRes[i] = FALSE;
+-	}
+-	if (haveLossyEntry)
+-		key->entryRes[lossyEntry] = TRUE;
++			case GIN_FALSE:
++				key->curItemMatches = false;
++				break;
+ 
+-	res = callConsistentFn(ginstate, key);
++			case GIN_MAYBE:
++				/*
++				 * The consistent function cannot decide with the information
++				 * we've got. If there are any "unknown" sources left, advance
++				 * one of them and try again, in the hope that it can decide
++				 * with the extra information.
++				 */
++				if (minUnknown != -1)
++				{
++					entry = key->scanEntry[minUnknown];
++					entryGetItem(ginstate, entry, advancePast);
++					continue;
++				}
++				key->curItemMatches = true;
++				key->recheckCurItem = true;
++				break;
+ 
+-	if (!res && haveLossyEntry && lossyEntry < key->nuserentries)
+-	{
+-		/* try the other way for the lossy item */
+-		key->entryRes[lossyEntry] = FALSE;
++			default:
++				/*
++				 * the 'default' case shouldn't happen, but if the consistent
++				 * function returns something bogus, this is the safe result
++				 */
++				key->curItemMatches = true;
++				key->recheckCurItem = true;
++				break;
++		}
+ 
+-		res = callConsistentFn(ginstate, key);
++		/*
++		 * We have a tuple, and we know if it mathes or not. If it's a
++		 * non-match, we could continue to find the next matching tuple, but
++		 * let's break out and give scanGetItem a chance to advance the other
++		 * keys. They might be able to skip past to a much higher TID, allowing
++		 * us to save work.
++		 */
++		break;
+ 	}
+ 
+-	key->curItemMatches = res;
+-	/* If we matched a lossy entry, force recheckCurItem = true */
+-	if (haveLossyEntry)
+-		key->recheckCurItem = true;
+-
+ 	/* clean up after consistentFn calls */
+ 	MemoryContextSwitchTo(oldCtx);
+ 	MemoryContextReset(tempCtx);
+@@ -1055,7 +1124,7 @@ scanGetItem(IndexScanDesc scan, ItemPointerData advancePast,
+ 
+ 			/*
+ 			 * If this is the first key, remember this location as a
+-			 * potential match.
++			 * potential match, and proceed to check the rest of the keys.
+ 			 *
+ 			 * Otherwise, check if this is the same item that we checked the
+ 			 * previous keys for (or a lossy pointer for the same page). If
+@@ -1066,21 +1135,20 @@ scanGetItem(IndexScanDesc scan, ItemPointerData advancePast,
+ 			if (i == 0)
+ 			{
+ 				*item = key->curItem;
++				continue;
++			}
++
++			if (ItemPointerIsLossyPage(&key->curItem) ||
++				ItemPointerIsLossyPage(item))
++			{
++				Assert (GinItemPointerGetBlockNumber(&key->curItem) >= GinItemPointerGetBlockNumber(item));
++				match = (GinItemPointerGetBlockNumber(&key->curItem) ==
++						 GinItemPointerGetBlockNumber(item));
+ 			}
+ 			else
+ 			{
+-				if (ItemPointerIsLossyPage(&key->curItem) ||
+-					ItemPointerIsLossyPage(item))
+-				{
+-					Assert (GinItemPointerGetBlockNumber(&key->curItem) >= GinItemPointerGetBlockNumber(item));
+-					match = (GinItemPointerGetBlockNumber(&key->curItem) ==
+-							 GinItemPointerGetBlockNumber(item));
+-				}
+-				else
+-				{
+-					Assert(ginCompareItemPointers(&key->curItem, item) >= 0);
+-					match = (ginCompareItemPointers(&key->curItem, item) == 0);
+-				}
++				Assert(ginCompareItemPointers(&key->curItem, item) >= 0);
++				match = (ginCompareItemPointers(&key->curItem, item) == 0);
+ 			}
+ 		}
+ 	} while (!match);
+@@ -1297,7 +1365,7 @@ collectMatchesForHeapRow(IndexScanDesc scan, pendingPosition *pos)
+ 	{
+ 		GinScanKey	key = so->keys + i;
+ 
+-		memset(key->entryRes, FALSE, key->nentries);
++		memset(key->entryRes, GIN_FALSE, key->nentries);
+ 	}
+ 	memset(pos->hasMatchKey, FALSE, so->nkeys);
+ 
+@@ -1554,7 +1622,7 @@ scanPendingInsert(IndexScanDesc scan, TIDBitmap *tbm, int64 *ntids)
+ 		{
+ 			GinScanKey	key = so->keys + i;
+ 
+-			if (!callConsistentFn(&so->ginstate, key))
++			if (!key->boolConsistentFn(key))
+ 			{
+ 				match = false;
+ 				break;
+diff --git a/src/backend/access/gin/ginlogic.c b/src/backend/access/gin/ginlogic.c
+new file mode 100644
+index 0000000..e499c6e
+--- /dev/null
++++ b/src/backend/access/gin/ginlogic.c
+@@ -0,0 +1,136 @@
++/*-------------------------------------------------------------------------
++ *
++ * ginlogic.c
++ *	  routines for performing binary- and ternary-logic consistent checks.
++ *
++ *
++ * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * IDENTIFICATION
++ *			src/backend/access/gin/ginlogic.c
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include "access/gin_private.h"
++#include "access/reloptions.h"
++#include "catalog/pg_collation.h"
++#include "catalog/pg_type.h"
++#include "miscadmin.h"
++#include "storage/indexfsm.h"
++#include "storage/lmgr.h"
++
++/*
++ * A dummy consistent function for an EVERYTHING key. Just claim it matches.
++ */
++static bool
++trueConsistentFn(GinScanKey key)
++{
++	key->recheckCurItem = false;
++	return true;
++}
++static GinLogicValue
++trueTriConsistentFn(GinScanKey key)
++{
++	return GIN_MAYBE;
++}
++
++/*
++ * A function for calling a regular, binary logic, consistent function.
++ */
++static bool
++normalBoolConsistentFn(GinScanKey key)
++{
++	/*
++	 * Initialize recheckCurItem in case the consistentFn doesn't know it
++	 * should set it.  The safe assumption in that case is to force recheck.
++	 */
++	key->recheckCurItem = true;
++
++	return DatumGetBool(FunctionCall8Coll(key->consistentFmgrInfo,
++										  key->collation,
++										  PointerGetDatum(key->entryRes),
++										  UInt16GetDatum(key->strategy),
++										  key->query,
++										  UInt32GetDatum(key->nuserentries),
++										  PointerGetDatum(key->extra_data),
++									   PointerGetDatum(&key->recheckCurItem),
++										  PointerGetDatum(key->queryValues),
++									 PointerGetDatum(key->queryCategories)));
++}
++
++/*
++ * This function implements a tri-state consistency check, using a boolean
++ * consistent function provided by the opclass.
++ *
++ * If there is only one MAYBE input, our strategy is to try the consistentFn
++ * both ways. If it returns TRUE for both, the tuple matches regardless of
++ * the MAYBE input, so we return TRUE. Likewise, if it returns FALSE for both,
++ * we return FALSE. Otherwise return MAYBE.
++ */
++static GinLogicValue
++shimTriConsistentFn(GinScanKey key)
++{
++	bool		foundMaybe = false;
++	int			maybeEntry = -1;
++	int			i;
++	bool		boolResult1;
++	bool		boolResult2;
++	bool		recheck1;
++	bool		recheck2;
++
++	for (i = 0; i < key->nentries; i++)
++	{
++		if (key->entryRes[i] == GIN_MAYBE)
++		{
++			if (foundMaybe)
++				return GIN_MAYBE;		/* more than one MAYBE input */
++			maybeEntry = i;
++			foundMaybe = true;
++		}
++	}
++
++	/*
++	 * If none of the inputs were MAYBE, so we can just call consistent
++	 * function as is.
++	 */
++	if (!foundMaybe)
++		return normalBoolConsistentFn(key);
++
++	/* Try the consistent function with the maybe-input set both ways */
++	key->entryRes[maybeEntry] = GIN_TRUE;
++	boolResult1 = normalBoolConsistentFn(key);
++	recheck1 = key->recheckCurItem;
++
++	key->entryRes[maybeEntry] = GIN_FALSE;
++	boolResult2 = normalBoolConsistentFn(key);
++	recheck2 = key->recheckCurItem;
++
++	if (!boolResult1 && !boolResult2)
++		return GIN_FALSE;
++
++	key->recheckCurItem = recheck1 || recheck2;
++	if (boolResult1 && boolResult2)
++		return GIN_TRUE;
++	else
++		return GIN_MAYBE;
++}
++
++void
++GinInitConsistentMethod(GinState *ginstate, GinScanKey key)
++{
++	if (key->searchMode == GIN_SEARCH_MODE_EVERYTHING)
++	{
++		key->boolConsistentFn = trueConsistentFn;
++		key->triConsistentFn = trueTriConsistentFn;
++	}
++	else
++	{
++		key->consistentFmgrInfo = &ginstate->consistentFn[key->attnum - 1];
++		key->collation = ginstate->supportCollation[key->attnum - 1];
++		key->boolConsistentFn = normalBoolConsistentFn;
++		key->triConsistentFn = shimTriConsistentFn;
++	}
++}
+diff --git a/src/include/access/gin_private.h b/src/include/access/gin_private.h
+index a12dfc3..6d6a49a 100644
+--- a/src/include/access/gin_private.h
++++ b/src/include/access/gin_private.h
+@@ -17,6 +17,8 @@
+ #include "storage/bufmgr.h"
+ #include "utils/rbtree.h"
+ 
++typedef struct GinScanKeyData *GinScanKey;
++typedef struct GinScanEntryData *GinScanEntry;
+ 
+ /*
+  * Page opaque data in an inverted index page.
+@@ -588,6 +590,19 @@ extern OffsetNumber gintuple_get_attrnum(GinState *ginstate, IndexTuple tuple);
+ extern Datum gintuple_get_key(GinState *ginstate, IndexTuple tuple,
+ 				 GinNullCategory *category);
+ 
++/* ginlogic.c */
++
++enum
++{
++	GIN_FALSE = 0,
++	GIN_TRUE = 1,
++	GIN_MAYBE = 2
++} GinLogicValueEnum;
++
++typedef char GinLogicValue;
++
++extern void GinInitConsistentMethod(GinState *ginstate, GinScanKey key);
++
+ /* gininsert.c */
+ extern Datum ginbuild(PG_FUNCTION_ARGS);
+ extern Datum ginbuildempty(PG_FUNCTION_ARGS);
+@@ -733,10 +748,6 @@ extern void ginVacuumPostingTreeLeaf(Relation rel, Buffer buf, GinVacuumState *g
+  * nuserentries is the number that extractQueryFn returned (which is what
+  * we report to consistentFn).	The "user" entries must come first.
+  */
+-typedef struct GinScanKeyData *GinScanKey;
+-
+-typedef struct GinScanEntryData *GinScanEntry;
+-
+ typedef struct GinScanKeyData
+ {
+ 	/* Real number of entries in scanEntry[] (always > 0) */
+@@ -749,6 +760,10 @@ typedef struct GinScanKeyData
+ 
+ 	/* array of check flags, reported to consistentFn */
+ 	bool	   *entryRes;
++	bool		(*boolConsistentFn) (GinScanKey key);
++	bool		(*triConsistentFn) (GinScanKey key);
++	FmgrInfo   *consistentFmgrInfo;
++	Oid			collation;
+ 
+ 	/* other data needed for calling consistentFn */
+ 	Datum		query;
+-- 
+1.8.5.2
+

@@ -1,0 +1,236 @@
+diff --git a/src/backend/access/gin/ginget.c b/src/backend/access/gin/ginget.c
+new file mode 100644
+index 76a70a0..00a45bb
+*** a/src/backend/access/gin/ginget.c
+--- b/src/backend/access/gin/ginget.c
+*************** entryGetItem(GinState *ginstate, GinScan
+*** 729,734 ****
+--- 729,754 ----
+  }
+  
+  /*
++  * Comparison function for scan entry indexes. Sorts them by descending of
++  * curItem assuming lossy page is lowest item pointer in page.
++  */
++ static int
++ cmpEntries(const void *a1, const void *a2, void *arg)
++ {
++ 	const GinScanKey key = (const GinScanKey)arg;
++ 	int i1 = *(const int *)a1;
++ 	int i2 = *(const int *)a2;
++ 	ItemPointerData iptr1 = key->scanEntry[i1]->curItem;
++ 	ItemPointerData iptr2 = key->scanEntry[i2]->curItem;
++ 
++ 	if (ItemPointerIsLossyPage(&iptr1))
++ 		iptr1.ip_posid = 0;
++ 	if (ItemPointerIsLossyPage(&iptr2))
++ 		iptr2.ip_posid = 0;
++ 	return -ginCompareItemPointers(&iptr1, &iptr2);
++ }
++ 
++ /*
+   * Identify the "current" item among the input entry streams for this scan key
+   * that is greater than advancePast, and test whether it passes the scan key
+   * qual condition.
+*************** keyGetItem(GinState *ginstate, MemoryCon
+*** 763,768 ****
+--- 783,789 ----
+  	bool		allUnknown;
+  	int			minUnknown;
+  	GinLogicValue res;
++ 	int		   *entryIndexes;
+  
+  	Assert(!key->isFinished);
+  
+*************** keyGetItem(GinState *ginstate, MemoryCon
+*** 783,791 ****
+--- 804,856 ----
+  	 * pointers, which is good.
+  	 */
+  	oldCtx = CurrentMemoryContext;
++ 	entryIndexes = (int *)MemoryContextAlloc(tempCtx,
++ 			sizeof(int) * key->nentries);
++ 	for (i = 0; i < key->nentries; i++)
++ 		entryIndexes[i] = i;
+  
+  	for (;;)
+  	{
++ restart:
++ 		qsort_arg(entryIndexes, key->nentries, sizeof(int), cmpEntries, key);
++ 		for (i = 0; i < key->nentries; i++)
++ 			key->entryRes[i] = GIN_MAYBE;
++ 		for (i = 0; i < key->nentries - 1; i++)
++ 		{
++ 			uint32 minPredictNumberResult;
++ 			int minPredictNumberResultIndex = -1;
++ 
++ 			key->entryRes[entryIndexes[i]] = GIN_FALSE;
++ 
++ 			if (ginCompareItemPointers(
++ 					&key->scanEntry[entryIndexes[i]]->curItem,
++ 					&key->scanEntry[entryIndexes[i + 1]]->curItem) == 0)
++ 				continue;
++ 
++ 			MemoryContextSwitchTo(tempCtx);
++ 			res = key->triConsistentFn(key);
++ 			MemoryContextSwitchTo(oldCtx);
++ 			if (res == GIN_FALSE)
++ 			{
++ 				int j;
++ 				advancePast = key->scanEntry[entryIndexes[i]]->curItem;
++ 				advancePast.ip_posid--;
++ 				for (j = i + 1; j < key->nentries; j++)
++ 				{
++ 					GinScanEntry entry = key->scanEntry[entryIndexes[j]];
++ 					if (minPredictNumberResultIndex == -1 ||
++ 							entry->predictNumberResult < minPredictNumberResult)
++ 					{
++ 						minPredictNumberResult = entry->predictNumberResult;
++ 						minPredictNumberResultIndex = entryIndexes[j];
++ 					}
++ 				}
++ 				Assert(minPredictNumberResultIndex >= 0);
++ 				entryGetItem(ginstate, key->scanEntry[minPredictNumberResultIndex], advancePast);
++ 				goto restart;
++ 			}
++ 		}
++ 
+  		ItemPointerSetMax(&minItem);
+  		allFinished = true;
+  		allUnknown = true;
+*************** keyGetItem(GinState *ginstate, MemoryCon
+*** 798,812 ****
+  				continue;
+  			allFinished = false;
+  
+! 			if (!entry->isFinished &&
+! 				ginCompareItemPointers(&entry->curItem, &advancePast) > 0)
+! 			{
+! 				allUnknown = false;
+! 				if (ginCompareItemPointers(&entry->curItem, &minItem) < 0)
+! 					minItem = entry->curItem;
+! 			}
+! 			else if (minUnknown == -1)
+! 				minUnknown = i;
+  		}
+  
+  		if (allFinished)
+--- 863,873 ----
+  				continue;
+  			allFinished = false;
+  
+! 			if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
+! 				entryGetItem(ginstate, entry, advancePast);
+! 
+! 			if (ginCompareItemPointers(&entry->curItem, &minItem) < 0)
+! 				minItem = entry->curItem;
+  		}
+  
+  		if (allFinished)
+*************** keyGetItem(GinState *ginstate, MemoryCon
+*** 816,891 ****
+  			return;
+  		}
+  
+- 		if (allUnknown)
+- 		{
+- 			/*
+- 			 * We must have an item from at least one source to have a match.
+- 			 * Fetch the next item > advancePast from the first (non-finished)
+- 			 * entry stream.
+- 			 */
+- 			entry = key->scanEntry[minUnknown];
+- 			entryGetItem(ginstate, entry, advancePast);
+- 			continue;
+- 		}
+- 
+- 		/*
+- 		 * We now have minItem set to the minimum among input streams *that*
+- 		 * we know. Some streams might be in unknown state, meaning we don't
+- 		 * know the next value from that input.
+- 		 *
+- 		 * Determine if any items between advancePast and minItem might match.
+- 		 * Such items might come from one of the unknown sources, but it's
+- 		 * possible that the consistent function can refute them all, ie. 
+- 		 * the consistent logic says that they cannot match without any of the
+- 		 * sources that we have loaded.
+- 		 */
+- 		if (minUnknown != -1)
+- 		{
+- 			for (i = 0; i < key->nentries; i++)
+- 			{
+- 				entry = key->scanEntry[i];
+- 				if (entry->isFinished)
+- 					key->entryRes[i] = GIN_FALSE;
+- 				else if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
+- 				{
+- 					/* this source is 'unloaded' */
+- 					key->entryRes[i] = GIN_MAYBE;
+- 				}
+- 				else
+- 				{
+- 					/*
+- 					 * we know the next item from this source to be >= minItem,
+- 					 * hence it's false for any items before < minItem
+- 					 */
+- 					key->entryRes[i] = GIN_FALSE;
+- 				}
+- 			}
+- 
+- 			MemoryContextSwitchTo(tempCtx);
+- 			res = key->triConsistentFn(key);
+- 			MemoryContextSwitchTo(oldCtx);
+- 
+- 			if (res == GIN_FALSE)
+- 			{
+- 				/*
+- 				 * All items between advancePast and minItem have been refuted.
+- 				 * Proceed with minItem.
+- 				 */
+- 				advancePast = minItem;
+- 				advancePast.ip_posid--;
+- 			}
+- 			else
+- 			{
+- 				/*
+- 				 * There might be matches smaller than minItem coming from one
+- 				 * of the unknown sources. Load more items, and retry.
+- 				 */
+- 				entry = key->scanEntry[minUnknown];
+- 				entryGetItem(ginstate, entry, advancePast);
+- 				continue;
+- 			}
+- 		}
+- 
+  		/*
+  		 * Ok, we now know that there are no matches < minItem. Proceed to
+  		 * check if it's a match.
+--- 877,882 ----
+*************** keyGetItem(GinState *ginstate, MemoryCon
+*** 895,919 ****
+  								GinItemPointerGetBlockNumber(&minItem));
+  
+  		/*
+- 		 * We might not have loaded all the entry streams for this TID. We
+- 		 * could call the consistent function, passing MAYBE for those entries,
+- 		 * to see if it can decide if this TID matches based on the information
+- 		 * we have. But if the consistent-function is expensive, and cannot
+- 		 * in fact decide with partial information, that could be a big loss.
+- 		 * So, loop back to load the missing entries, before calling the
+- 		 * consistent function.
+- 		 */
+- 		if (minUnknown != -1)
+- 		{
+- 			for (i = minUnknown; i < key->nentries; i++)
+- 			{
+- 				entry = key->scanEntry[i];
+- 				if (ginCompareItemPointers(&entry->curItem, &advancePast) <= 0)
+- 					entryGetItem(ginstate, entry, advancePast);
+- 			}
+- 		}
+- 
+- 		/*
+  		 * Lossy-page entries pose a problem, since we don't know the correct
+  		 * entryRes state to pass to the consistentFn, and we also don't know
+  		 * what its combining logic will be (could be AND, OR, or even NOT).
+--- 886,891 ----

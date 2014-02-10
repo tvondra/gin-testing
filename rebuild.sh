@@ -1,63 +1,71 @@
-#!/usr/bin/env sh
+#!/bin/bash
 
 . ./config.sh
 
+function log {
+	echo `date +'%Y%m%d %H:%M:%S'` ":" $1
+}
+
 for p in `ls $PATCHES`; do
 
-	echo "========== building $p ==========="
+	log "===== building $p ====="
 
 	mkdir -p $LOGS/$p
 	rm -Rf $BUILDS/$p
 
 	cd $REPOSITORY
 
-	echo "========== resetting repository ============"
+        REVDATE=`cat $PATCHES/$p/.date`
+
+	log "resetting repository to $REVDATE"
 	git reset --hard origin/master > $LOGS/$p/git-reset.log 2>&1
 	if [ $? -ne 0 ]; then
-		echo "git reset failed"
+		log "ERROR: git reset failed"
 		exit 1
 	fi
 
 	git clean -f > $LOGS/$p/git-clean.log 2>&1
         if [ $? -ne 0 ]; then
-                echo "git clean failed"
+                log "ERROR: git clean failed"
                 exit 1
         fi
 
-	git checkout `git rev-list -n 1 --before="$DATE" master` > $LOGS/$p/git-checkout.log 2>&1
+	git checkout `git rev-list -n 1 --before="$REVDATE" master` > $LOGS/$p/git-checkout.log 2>&1
         if [ $? -ne 0 ]; then
-                echo "git checkout failed"
+                log "ERROR: git checkout failed"
                 exit 1 
         fi
 
-	echo "========== applying patches ==========="
+	log "applying patches"
 	for f in `ls $PATCHES/$p`; do
 
-		echo "========== applying $p/$f ============"
+		log "    $p/$f"
 		patch -p1 < $PATCHES/$p/$f >> $LOGS/$p/patch.log 2>&1
 	        if [ $? -ne 0 ]; then
-        	        echo "applying $f failed"
+        	        log "ERROR: applying $f failed"
                 	exit 1
 	        fi
 
 	done
 
-	echo "========== rebuilding =============="
+	log "building (including contrib)"
 	./configure --prefix=$BUILDS/$p > $LOGS/$p/config.log 2>&1
         if [ $? -ne 0 ]; then
-                echo "configure failed"
+                log "ERROR: configure failed"
                 exit 1
         fi
 
-	make > $LOGS/$p/make.log 2>&1
+	make install > $LOGS/$p/make-install.log 2>&1
         if [ $? -ne 0 ]; then
-                echo "make failed"
+                log "ERROR: make install failed"
                 exit 1
         fi
 
-	make install > $LOGS/$p/install.log 2>&1
+	cd contrib
+
+	make install > $LOGS/$p/contrib-make-install.log 2>&1
         if [ $? -ne 0 ]; then
-                echo "make install failed"
+                log "ERROR: contrib make install failed"
                 exit 1
         fi
 

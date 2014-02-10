@@ -1,4 +1,5 @@
-data/.*
-json/.*
-results/.*
-logs/.*
+data/*
+json/*
+results/*
+logs/*
+builds/*
