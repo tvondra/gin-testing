@@ -58,7 +58,7 @@ def median(x):
 
 def stddev(x):
     a = average(x)    
-    return int(round(math.sqrt(sum([(z-a)*(z-a) for z in x]))))
+    return int(round(math.sqrt(sum([(z-a)*(z-a) for z in x])/len(x))))
 
 def list_patches():
     return os.listdir('patches')

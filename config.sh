@@ -2,6 +2,7 @@
 
 export HOMEDIR="/mnt/sas-raid10/gin-testing2"
 export PATCHES="$HOMEDIR/patches"
+export CONFIG="$HOMEDIR/config"
 export REPOSITORY="$HOMEDIR/postgres"
 export BUILDS="$HOMEDIR/builds"
 export LOGS="$HOMEDIR/logs"

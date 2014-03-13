@@ -10,12 +10,18 @@ for p in `ls $PATCHES`; do
 
 	log "===== building $p ====="
 
+	if [ -d "$BUILDS/$p" ]; then
+		log "$p : already built"
+		continue
+	fi
+
 	mkdir -p $LOGS/$p
-	rm -Rf $BUILDS/$p
+	# rm -Rf $BUILDS/$p
 
 	cd $REPOSITORY
 
         REVDATE=`cat $PATCHES/$p/.date`
+	BRANCH=`cat $PATCHES/$p/.branch`
 
 	log "resetting repository to $REVDATE"
 	git reset --hard origin/master > $LOGS/$p/git-reset.log 2>&1
@@ -30,7 +36,7 @@ for p in `ls $PATCHES`; do
                 exit 1
         fi
 
-	git checkout `git rev-list -n 1 --before="$REVDATE" master` > $LOGS/$p/git-checkout.log 2>&1
+	git checkout `git rev-list -n 1 --before="$REVDATE" $BRANCH` > $LOGS/$p/git-checkout.log 2>&1
         if [ $? -ne 0 ]; then
                 log "ERROR: git checkout failed"
                 exit 1 
@@ -55,7 +61,13 @@ for p in `ls $PATCHES`; do
                 exit 1
         fi
 
-	make install > $LOGS/$p/make-install.log 2>&1
+        make clean > $LOGS/$p/make-clean.log 2>&1
+        if [ $? -ne 0 ]; then
+                log "ERROR: make clean failed"
+                exit 1
+        fi
+
+	make -j8 install > $LOGS/$p/make-install.log 2>&1
         if [ $? -ne 0 ]; then
                 log "ERROR: make install failed"
                 exit 1
@@ -63,7 +75,7 @@ for p in `ls $PATCHES`; do
 
 	cd contrib
 
-	make install > $LOGS/$p/contrib-make-install.log 2>&1
+	make -j8 install > $LOGS/$p/contrib-make-install.log 2>&1
         if [ $? -ne 0 ]; then
                 log "ERROR: contrib make install failed"
                 exit 1
